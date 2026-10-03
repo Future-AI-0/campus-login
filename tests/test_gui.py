@@ -16,7 +16,7 @@ from PySide6.QtGui import QColor, QPalette
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QLineEdit
 
-from gui import LoginWindow, read_account_file, save_config
+from gui import LoginWindow, read_account_file, read_config, save_config, OPERATORS
 from login import Credentials, LoginCancelled, LoginError
 
 
@@ -67,6 +67,99 @@ class GuiTests(unittest.TestCase):
         account_file.write_text("demo-user|demo-password|中国电信\r\n", encoding="utf-16")
         credentials = read_account_file(account_file)
         self.assertEqual(credentials, Credentials("demo-user", "demo-password", "中国电信"))
+
+    def test_operator_only_allows_fixed_choices_and_import_aliases(self):
+        self.assertFalse(self.window.operator.isEditable())
+        self.assertEqual(tuple(self.window.operator.itemText(i) for i in range(self.window.operator.count())), OPERATORS)
+        self.window.apply_credentials(Credentials("demo", "password", "联通"))
+        self.assertEqual(self.window.operator.currentText(), "中国联通")
+        self.window.operator.setCurrentText("随意输入")
+        self.assertEqual(self.window.operator.currentText(), "中国联通")
+        with self.assertRaises(LoginError):
+            self.window.apply_credentials(Credentials("demo", "password", "未知运营商"))
+
+    def test_each_account_change_is_saved_immediately_including_empty(self):
+        self.fill()
+        self.window.username.setText("new-user")
+        self.assertEqual(read_config(self.path)["CAMPUS_USERNAME"], "new-user")
+        password = " new'\\${KEEP_LITERAL}# "
+        self.window.password.setText(password)
+        self.assertEqual(read_config(self.path)["CAMPUS_PASSWORD"], password)
+        self.window.operator.setCurrentText("中国电信")
+        self.assertEqual(read_config(self.path)["CAMPUS_OPERATOR"], "中国电信")
+        self.window.password.clear()
+        self.assertEqual(read_config(self.path)["CAMPUS_PASSWORD"], "")
+        with self.assertRaises(LoginError):
+            self.window.saved_credentials()
+        self.assertEqual(list(self.path.parent.glob("*.tmp")), [])
+
+    def test_config_is_replaced_atomically_and_preserves_other_keys(self):
+        self.path.write_text("OTHER_SETTING='keep'\n", encoding="utf-8")
+        original = self.path.read_bytes()
+        expected = Credentials("demo", "password", "中国移动")
+        replace = os.replace
+        final_commits = []
+        def verify_complete_snapshot(source, destination):
+            if Path(destination) != self.path:
+                return replace(source, destination)
+            final_commits.append(True)
+            self.assertEqual(Path(destination).read_bytes(), original)
+            values = dotenv_values(source, interpolate=False)
+            self.assertEqual(values["CAMPUS_USERNAME"], expected.username)
+            self.assertEqual(values["CAMPUS_PASSWORD"], expected.password)
+            self.assertEqual(values["CAMPUS_OPERATOR"], expected.operator)
+            self.assertEqual(values["OTHER_SETTING"], "keep")
+            replace(source, destination)
+        with patch("gui.os.replace", side_effect=verify_complete_snapshot):
+            save_config(self.path, expected)
+        self.assertEqual(len(final_commits), 1)
+
+    def test_saved_gui_config_takes_precedence_over_old_environment(self):
+        with patch.dict(os.environ, {"CAMPUS_USERNAME": "old-user", "CAMPUS_PASSWORD": "old-password", "CAMPUS_OPERATOR": "移动"}):
+            self.assertEqual(read_config(self.path)["CAMPUS_USERNAME"], "old-user")
+            self.fill()
+            self.window.password.setText("new-password")
+            self.assertEqual(self.window.saved_credentials(), Credentials("demo-user", "new-password", "中国联通"))
+
+    def test_import_saves_complete_account_without_extra_click(self):
+        account_file = Path(self.temp.name) / "account.txt"
+        account_file.write_text("demo-user|demo-password|联通", encoding="utf-8")
+        with patch("gui.QFileDialog.getOpenFileName", return_value=(str(account_file), "")):
+            self.window.import_account()
+        self.assertEqual(self.window.saved_credentials(), Credentials("demo-user", "demo-password", "中国联通"))
+
+    def test_autosave_can_be_disabled_and_resumed(self):
+        self.fill()
+        self.window.password.setText("saved-password")
+        self.window.remember.setChecked(False)
+        self.window.password.setText("temporary-password")
+        self.assertEqual(read_config(self.path)["CAMPUS_PASSWORD"], "saved-password")
+        self.window.remember.setChecked(True)
+        self.assertEqual(read_config(self.path)["CAMPUS_PASSWORD"], "temporary-password")
+
+    def test_automatic_login_waits_while_account_is_being_edited(self):
+        self.fill()
+        self.window.password.setText("new-password")
+        with patch("gui.run_login", return_value="校园网已连接。") as run, patch("gui.probe_reachable") as probe:
+            self.window.check_portal()
+            self.window.on_probe_result(True)
+            run.assert_not_called()
+            probe.assert_not_called()
+            self.window.account_edited_at -= 3
+            self.window.on_probe_result(True)
+            self.wait_until(lambda: self.window.worker is None)
+            self.assertEqual(run.call_args.args[0].password, "new-password")
+
+    def test_startup_toggle_applies_and_rolls_back_on_failure(self):
+        with patch("gui.set_startup") as apply:
+            self.window.startup.setChecked(True)
+            apply.assert_called_once_with(True)
+            self.window.startup.setChecked(False)
+            self.assertEqual(apply.call_args.args, (False,))
+        with patch("gui.set_startup", side_effect=OSError()), patch("gui.startup_enabled", return_value=False):
+            self.window.startup.setChecked(True)
+        self.assertFalse(self.window.startup.isChecked())
+        self.assertIn("无法修改", self.window.status.text())
 
     def test_login_runs_without_blocking_and_buttons_recover(self):
         self.fill()
@@ -123,7 +216,8 @@ class GuiTests(unittest.TestCase):
         save_config(self.path, credentials)
         for key in ("CAMPUS_USERNAME", "CAMPUS_PASSWORD", "CAMPUS_OPERATOR"):
             os.environ.pop(key, None)
-        # 草稿与保存的配置不同，自动登录应始终使用已保存配置。
+        # 用户关闭自动保存时，草稿不覆盖后台使用的已保存配置。
+        self.window.remember.setChecked(False)
         self.window.apply_credentials(Credentials("unsaved-user", "unsaved-password", "中国移动"))
         return credentials
 

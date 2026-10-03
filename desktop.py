@@ -1,4 +1,4 @@
-"""Windows 桌面快捷方式和同一用户的单实例入口。"""
+"""Windows 快捷方式、当前用户开机启动和单实例入口。"""
 from __future__ import annotations
 
 import base64
@@ -9,6 +9,39 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
+
+if sys.platform == "win32":
+    import winreg
+
+STARTUP_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+STARTUP_NAME = "CampusLogin"
+
+
+def startup_enabled() -> bool:
+    if sys.platform != "win32":
+        return False
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_KEY) as key:
+            value, _ = winreg.QueryValueEx(key, STARTUP_NAME)
+            return bool(value)
+    except OSError:
+        return False
+
+
+def set_startup(enabled: bool) -> None:
+    """仅修改本程序的当前用户启动项，不需管理员权限。"""
+    if sys.platform != "win32":
+        raise OSError("开机启动仅支持 Windows")
+    with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, STARTUP_KEY, 0, winreg.KEY_SET_VALUE) as key:
+        if enabled:
+            target, arguments, _ = shortcut_launch()
+            command = subprocess.list2cmdline([str(target), *arguments, "--startup"])
+            winreg.SetValueEx(key, STARTUP_NAME, 0, winreg.REG_SZ, command)
+        else:
+            try:
+                winreg.DeleteValue(key, STARTUP_NAME)
+            except FileNotFoundError:
+                pass
 
 
 def shortcut_launch() -> tuple[Path, list[str], Path]:
@@ -70,25 +103,25 @@ class SingleInstance(QObject):
         self.server.newConnection.connect(self.accept_connection)
         self.clients = []
 
-    def contact_existing(self) -> bool:
+    def contact_existing(self, show_existing: bool = True) -> bool:
         socket = QLocalSocket()
         socket.connectToServer(self.name)
         if not socket.waitForConnected(300):
             return False
-        socket.write(b"show\n")
+        socket.write(b"show\n" if show_existing else b"ping\n")
         socket.waitForBytesWritten(300)
         # Windows 命名管道需等服务端读取后再关闭，否则请求可能被丢弃。
         socket.waitForReadyRead(1500)
         socket.disconnectFromServer()
         return True
 
-    def acquire(self) -> bool:
-        if self.contact_existing():
+    def acquire(self, show_existing: bool = True) -> bool:
+        if self.contact_existing(show_existing):
             return False
         if self.server.listen(self.name):
             return True
         # 再检查一次，覆盖两个进程同时启动的情况。
-        if self.contact_existing():
+        if self.contact_existing(show_existing):
             return False
         QLocalServer.removeServer(self.name)
         return self.server.listen(self.name)

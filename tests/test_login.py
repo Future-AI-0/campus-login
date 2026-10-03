@@ -160,7 +160,7 @@ class PortalTests(unittest.TestCase):
         with self.assertRaisesRegex(LoginError, "未确认连接成功"):
             automate(self.page, self.credentials, 1, False, PORTAL_URL)
 
-    def test_terminal_555_stops_before_submission(self):
+    def test_terminal_555_is_already_online_without_submission(self):
         def handler(route):
             if 'queryTerminalInfo' in route.request.url:
                 route.fulfill(status=555)
@@ -168,8 +168,29 @@ class PortalTests(unittest.TestCase):
                 route.fulfill(content_type='text/html', body='''网络连接中...
                   <script>setInterval(()=>fetch('/eportal/adaptor/queryTerminalInfo'),100)</script>''')
         self.context.route('**/*', handler)
-        with self.assertRaisesRegex(LoginError, 'HTTP 555'):
-            automate(self.page, self.credentials, 4, False, PORTAL_URL)
+        result = automate(self.page, self.credentials, 4, False, PORTAL_URL)
+        self.assertIn("无需重复登录", result)
+        self.assertEqual(self.submissions, [])
+
+    def test_entry_555_is_already_online(self):
+        self.context.route('**/*', lambda route: route.fulfill(status=555, body="已登录"))
+        self.assertIn("无需重复登录", automate(self.page, self.credentials, 4, False, PORTAL_URL))
+
+    def test_unrelated_555_does_not_mark_online(self):
+        def handler(route):
+            if route.request.url.endswith('/tracking'):
+                route.fulfill(status=555)
+            else:
+                route.fulfill(content_type='text/html', body='''网络连接中...
+                  <script>fetch('/tracking');fetch('http://example.test/tracking')</script>''')
+        self.context.route('**/*', handler)
+        with self.assertRaisesRegex(LoginError, '未确认连接成功'):
+            automate(self.page, self.credentials, 1, False, PORTAL_URL)
+
+    def test_service_555_confirms_connection(self):
+        self.serve()
+        self.context.route('**/eportal/network/serviceLogin', lambda route: route.fulfill(status=555, json={}))
+        self.assertEqual(automate(self.page, self.credentials, 5, False, PORTAL_URL), "校园网已连接。")
 
     def test_agreement_already_checked_stays_checked(self):
         self.context.route('**/*', lambda route: route.fulfill(content_type='text/html', body=FORM))

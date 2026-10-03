@@ -19,7 +19,7 @@ from PySide6.QtCore import QProcess
 from PySide6.QtWidgets import QApplication
 
 from background import AutoLoginPolicy, PortalRedirectHandler, load_preferences, probe_reachable, save_preferences
-from desktop import SingleInstance, shortcut_script
+from desktop import SingleInstance, shortcut_script, set_startup, startup_enabled, STARTUP_KEY, STARTUP_NAME
 from login import PORTAL_URL
 
 
@@ -64,11 +64,23 @@ class BackgroundTests(unittest.TestCase):
         opener.open.return_value = response
         with patch("background.build_opener", return_value=opener):
             self.assertFalse(probe_reachable(PORTAL_URL))
-            response.url, response.status = PORTAL_URL, 555
+            response.url, response.status = PORTAL_URL, 503
             self.assertFalse(probe_reachable(PORTAL_URL))
         handler = PortalRedirectHandler()
         with self.assertRaises(HTTPError):
             handler.redirect_request(Request(PORTAL_URL), None, 302, "Found", {}, "https://example.org/login")
+
+    def test_probe_accepts_555_but_only_from_portal(self):
+        opener = MagicMock()
+        response = MagicMock(status=555, url=PORTAL_URL)
+        response.__enter__.return_value = response
+        opener.open.return_value = response
+        with patch("background.build_opener", return_value=opener):
+            self.assertTrue(probe_reachable(PORTAL_URL))
+            opener.open.side_effect = HTTPError(PORTAL_URL, 555, "Online", {}, None)
+            self.assertTrue(probe_reachable(PORTAL_URL))
+            opener.open.side_effect = HTTPError("https://example.org/portal/login", 555, "Error", {}, None)
+            self.assertFalse(probe_reachable(PORTAL_URL))
 
     def test_preferences_restore_and_ignore_corrupt_data(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -97,6 +109,26 @@ class BackgroundTests(unittest.TestCase):
             self.assertEqual(run.call_args.kwargs["creationflags"], subprocess.CREATE_NO_WINDOW)
             self.assertEqual(run.call_args.kwargs["stdout"], subprocess.DEVNULL)
 
+    def test_startup_registers_quoted_current_user_command(self):
+        target = Path("C:/用户/Program Files/CampusLogin.exe")
+        with patch("desktop.winreg") as registry, patch("desktop.shortcut_launch", return_value=(target, ["--background"], target.parent)):
+            set_startup(True)
+            registry.CreateKeyEx.assert_called_once_with(registry.HKEY_CURRENT_USER, STARTUP_KEY, 0, registry.KEY_SET_VALUE)
+            args = registry.SetValueEx.call_args.args
+            self.assertEqual(args[1], STARTUP_NAME)
+            self.assertEqual(args[-1], subprocess.list2cmdline([str(target), "--background", "--startup"]))
+
+    def test_startup_can_be_read_and_removed_repeatedly(self):
+        with patch("desktop.winreg") as registry:
+            registry.QueryValueEx.return_value = ("quoted launch command", registry.REG_SZ)
+            self.assertTrue(startup_enabled())
+            registry.QueryValueEx.side_effect = FileNotFoundError()
+            self.assertFalse(startup_enabled())
+            registry.DeleteValue.side_effect = FileNotFoundError()
+            set_startup(False)
+            registry.DeleteValue.assert_called_once()
+            registry.SetValueEx.assert_not_called()
+
     def test_second_instance_requests_existing_window(self):
         app = QApplication.instance() or QApplication([])
         first = SingleInstance()
@@ -118,6 +150,14 @@ class BackgroundTests(unittest.TestCase):
             self.assertEqual(child.state(), QProcess.ProcessState.NotRunning)
             self.assertEqual(child.exitCode(), 0)
             self.assertEqual(received, [True])
+            child.start(sys.executable, ["-c", code.replace("instance.acquire()", "instance.acquire(show_existing=False)")])
+            for _ in range(150):
+                QTest.qWait(20)
+                if child.state() == QProcess.ProcessState.NotRunning:
+                    break
+            self.assertEqual(child.state(), QProcess.ProcessState.NotRunning)
+            self.assertEqual(child.exitCode(), 0)
+            self.assertEqual(received, [True], "开机重复启动不应弹出已有窗口")
         finally:
             first.server.close()
 

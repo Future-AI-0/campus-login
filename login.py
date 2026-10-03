@@ -175,17 +175,21 @@ def choose_operator(page: Page, operator: str) -> Locator | None:
 class PortalStatus:
     online: bool = False
     error: str = ""
-    terminal_failures: int = 0
 
     def observe(self, response: Response) -> None:
         url = urlsplit(response.url)
         if url.hostname != PORTAL_HOST:
             return
+        # 本校门户用 HTTP 555 表示已在线；只接受入口和认证接口的响应。
+        if response.status == 555 and (
+            url.path.startswith("/portal/") or url.path in (
+                "/eportal/adaptor/queryTerminalInfo", "/eportal/adaptor/getOnlineUserInfo",
+                "/eportal/network/serviceLogin", "/eportal/network/operatorLogin",
+            )
+        ):
+            self.online = True
+            return
         if url.path == "/eportal/adaptor/queryTerminalInfo":
-            if response.status == 555:
-                self.terminal_failures += 1
-            elif response.ok:
-                self.terminal_failures = 0
             return
         if url.path not in (
             "/eportal/adaptor/getOnlineUserInfo",
@@ -225,12 +229,6 @@ def is_connected(page: Page, status: PortalStatus) -> bool:
 def check_failure(page: Page, status: PortalStatus) -> None:
     if status.error:
         raise LoginError(status.error)
-    if status.terminal_failures >= 3:
-        raise LoginError(
-            "校园网终端信息接口持续返回 HTTP 555，无法加载认证表单。"
-            "请确认网线或 Wi-Fi 已连接校园网；双网络连接、代理/TUN 或失效入口可能影响认证。"
-            "可用 --url 指定校园网重新跳转生成的完整入口。"
-        )
     if page.url.startswith("chrome-error:"):
         raise LoginError("认证页面或其跳转地址无法访问，请检查校园网连接和入口地址。")
     for frame in trusted_frames(page):

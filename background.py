@@ -29,8 +29,10 @@ def probe_reachable(url: str, timeout: float = 3) -> bool:
     opener = build_opener(ProxyHandler({}), PortalRedirectHandler())
     try:
         with opener.open(request, timeout=timeout) as response:
-            return 200 <= response.status < 300 and urlsplit(response.url).hostname == PORTAL_HOST
-    except (HTTPError, URLError, OSError, TimeoutError, ValueError):
+            return (200 <= response.status < 300 or response.status == 555) and urlsplit(response.url).hostname == PORTAL_HOST
+    except HTTPError as exc:
+        return exc.code == 555 and urlsplit(exc.url).hostname == PORTAL_HOST and urlsplit(exc.url).path.startswith("/portal/")
+    except (URLError, OSError, TimeoutError, ValueError):
         return False
 
 

@@ -5,11 +5,12 @@ import os
 import sys
 import threading
 import time
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
 from dotenv import dotenv_values, set_key
-from PySide6.QtCore import QThread, QTimer, Qt, Signal, Slot
+from PySide6.QtCore import QSignalBlocker, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QColor, QCloseEvent, QFont, QPalette
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout,
@@ -18,26 +19,46 @@ from PySide6.QtWidgets import (
 )
 
 from background import AutoLoginPolicy, PROBE_INTERVAL_MS, load_preferences, probe_reachable, save_preferences
-from desktop import SingleInstance, ensure_desktop_shortcut
+from desktop import SingleInstance, ensure_desktop_shortcut, set_startup, startup_enabled
 from login import (
     BrowserError, Credentials, LoginCancelled, LoginError, PORTAL_URL,
     ROOT, redact, run_login, validate_url,
 )
 
+OPERATORS = ("中国移动", "中国联通", "中国电信", "校园网")
+
+
+def canonical_operator(value: str) -> str:
+    aliases = {"移动": "中国移动", "联通": "中国联通", "电信": "中国电信"}
+    value = aliases.get(value.strip(), value.strip())
+    if value and value not in OPERATORS:
+        raise LoginError("请选择支持的运营商：中国移动、中国联通、中国电信或校园网。")
+    return value
+
 
 def read_config(path: Path) -> dict[str, str]:
     stored = dotenv_values(path, interpolate=False) if path.exists() else {}
     keys = ("CAMPUS_USERNAME", "CAMPUS_PASSWORD", "CAMPUS_OPERATOR")
-    return {key: os.environ.get(key, stored.get(key) or "") for key in keys}
+    # 界面修改的本机配置优先，避免环境变量使自动登录继续使用旧账号。
+    return {key: (stored[key] or "") if key in stored else os.environ.get(key, "") for key in keys}
 
 
 def save_config(path: Path, credentials: Credentials) -> None:
-    for key, value in zip(
-        ("CAMPUS_USERNAME", "CAMPUS_PASSWORD", "CAMPUS_OPERATOR"),
-        (credentials.username, credentials.password, credentials.operator),
-    ):
-        quoted = "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
-        set_key(path, key, quoted, quote_mode="never", encoding="utf-8")
+    # 先写完整快照再替换，后台线程不会读到新旧账号混合的配置。
+    with tempfile.NamedTemporaryFile(dir=path.parent, prefix=path.name + ".", suffix=".tmp", delete=False) as stream:
+        temporary = Path(stream.name)
+    try:
+        if path.exists():
+            temporary.write_bytes(path.read_bytes())
+        for key, value in zip(
+            ("CAMPUS_USERNAME", "CAMPUS_PASSWORD", "CAMPUS_OPERATOR"),
+            (credentials.username, credentials.password, credentials.operator),
+        ):
+            quoted = "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+            set_key(temporary, key, quoted, quote_mode="never", encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def read_account_file(path: Path) -> Credentials:
@@ -59,8 +80,6 @@ def read_account_file(path: Path) -> Credentials:
 
 
 def friendly_error(message: str) -> str:
-    if "HTTP 555" in message:
-        return "校园网入口暂时无法识别当前设备（HTTP 555）。请检查校园网连接和终端注册状态，或在高级设置中粘贴校园网新生成的完整入口。"
     return message.replace("CAMPUS_OPERATOR", "运营商")
 
 
@@ -156,6 +175,7 @@ class LoginWindow(QMainWindow):
         self.preferences = load_preferences(self.settings_path)
         self.background_services = background_services
         self.policy = AutoLoginPolicy()
+        self.account_edited_at = 0.0
         self.worker: LoginWorker | None = None
         self.probe_worker: ProbeWorker | None = None
         self.automatic_attempt = False
@@ -171,7 +191,7 @@ class LoginWindow(QMainWindow):
         self.activation_timer.timeout.connect(self.activate_restored_window)
         self.setWindowTitle("校园网登录")
         self.setMinimumWidth(510)
-        self.resize(550, 740)
+        self.resize(550, 775)
         self.setStyleSheet(STYLE)
 
         container = QWidget()
@@ -201,10 +221,10 @@ class LoginWindow(QMainWindow):
         self.password.setPlaceholderText("请输入校园网密码")
         self.password.setAccessibleName("校园网密码")
         self.operator = QComboBox()
-        self.operator.setEditable(True)
-        self.operator.addItems(["中国移动", "中国联通", "中国电信", "校园网"])
+        self.operator.setEditable(False)
+        self.operator.addItems(OPERATORS)
+        self.operator.setPlaceholderText("请选择运营商")
         self.operator.setCurrentIndex(-1)
-        self.operator.lineEdit().setPlaceholderText("选择或填写页面上的运营商")
         self.operator.setAccessibleName("运营商")
         form.addRow("账号", self.username)
         form.addRow("密码", self.password)
@@ -212,9 +232,9 @@ class LoginWindow(QMainWindow):
         card_layout.addLayout(form)
 
         options = QHBoxLayout()
-        self.remember = QCheckBox("保存到本机")
-        self.remember.setToolTip("将账号、密码和运营商保存在程序旁的 .env 文件中")
-        self.remember.setChecked(self.config_path.exists())
+        self.remember = QCheckBox("自动保存到本机")
+        self.remember.setToolTip("修改账号、密码或运营商时，立即更新程序旁的 .env 文件")
+        self.remember.setChecked(True)
         self.show_password = QCheckBox("显示密码")
         self.show_password.toggled.connect(lambda checked: self.password.setEchoMode(QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password))
         options.addWidget(self.remember)
@@ -236,6 +256,12 @@ class LoginWindow(QMainWindow):
         self.auto_login.setChecked(self.preferences["auto_login"])
         self.auto_login.setToolTip("每 15 秒检测校园网入口，使用已保存的配置在后台认证；失败后间隔重试")
         card_layout.addWidget(self.auto_login)
+
+        self.startup = QCheckBox("开机启动（登录 Windows 后）")
+        self.startup.setToolTip("登录 Windows 后静默进入托盘；取消勾选即可删除本程序的启动项")
+        self.startup.setChecked(startup_enabled() if self.background_services else False)
+        self.startup.toggled.connect(self.toggle_startup)
+        card_layout.addWidget(self.startup)
 
         self.advanced_button = QPushButton("高级设置")
         self.advanced_button.setObjectName("advanced")
@@ -296,8 +322,13 @@ class LoginWindow(QMainWindow):
         try:
             values = read_config(self.config_path)
             self.apply_credentials(Credentials(values["CAMPUS_USERNAME"], values["CAMPUS_PASSWORD"], values["CAMPUS_OPERATOR"]))
-        except (OSError, UnicodeError):
+        except (OSError, UnicodeError, LoginError):
             self.show_status("无法读取本机配置，可以手动填写后登录。", False)
+
+        self.username.textChanged.connect(self.autosave_account)
+        self.password.textChanged.connect(self.autosave_account)
+        self.operator.currentIndexChanged.connect(self.autosave_account)
+        self.remember.toggled.connect(self.autosave_account)
 
         self.monitor_timer = QTimer(self)
         self.monitor_timer.setInterval(PROBE_INTERVAL_MS)
@@ -396,10 +427,34 @@ class LoginWindow(QMainWindow):
 
     def saved_credentials(self) -> Credentials:
         values = read_config(self.config_path)
-        result = Credentials(values["CAMPUS_USERNAME"], values["CAMPUS_PASSWORD"], values["CAMPUS_OPERATOR"])
+        result = Credentials(values["CAMPUS_USERNAME"], values["CAMPUS_PASSWORD"], canonical_operator(values["CAMPUS_OPERATOR"]))
         if any(not value.strip() for value in (result.username, result.password, result.operator)):
-            raise LoginError("自动登录需要先填写账号、密码和运营商，并点击“保存配置”。")
+            raise LoginError("自动登录需要先填写并保存账号、密码和运营商。")
         return result
+
+    def toggle_startup(self, enabled: bool) -> None:
+        try:
+            set_startup(enabled)
+            self.append_log("已启用开机启动，登录 Windows 后将在托盘运行。" if enabled else "已关闭开机启动。")
+        except OSError:
+            with QSignalBlocker(self.startup):
+                self.startup.setChecked(startup_enabled())
+            self.show_status("无法修改开机启动项，请检查当前用户的 Windows 权限。", False)
+
+    def autosave_account(self) -> bool:
+        if not self.remember.isChecked():
+            return True
+        self.account_edited_at = time.monotonic()
+        try:
+            # 空字段也保存，清空输入后不会继续使用旧凭据。
+            save_config(self.config_path, Credentials(
+                self.username.text().strip(), self.password.text(), self.operator.currentText(),
+            ))
+            self.policy = AutoLoginPolicy()
+            return True
+        except OSError:
+            self.show_status("无法自动保存配置，请确认程序文件夹可以写入。", False)
+            return False
 
     def toggle_monitoring(self, enabled: bool) -> None:
         self.persist_preferences()
@@ -420,12 +475,14 @@ class LoginWindow(QMainWindow):
     def check_portal(self) -> None:
         if self.quitting or not self.auto_login.isChecked() or self.worker is not None or self.probe_worker is not None:
             return
+        if time.monotonic() - self.account_edited_at < 2.5:
+            return
         try:
             self.saved_credentials()
             url = self.entry_url.text().strip()
             validate_url(url)
         except (LoginError, OSError, UnicodeError):
-            self.status.setText("静默检测等待配置：请填写账号信息并点击“保存配置”。")
+            self.status.setText("静默检测等待配置：请填写并保存账号信息。")
             return
         self.probe_worker = ProbeWorker(url, self)
         self.probe_worker.result.connect(self.on_probe_result)
@@ -435,6 +492,9 @@ class LoginWindow(QMainWindow):
     @Slot(bool)
     def on_probe_result(self, reachable: bool) -> None:
         if self.quitting or not self.auto_login.isChecked() or self.worker is not None:
+            return
+        # 配置立即写盘，但输入尚未停顿时不自动提交半截密码。
+        if time.monotonic() - self.account_edited_at < 2.5:
             return
         was_reachable = self.policy.reachable
         due = self.policy.probe(reachable, time.monotonic())
@@ -455,9 +515,11 @@ class LoginWindow(QMainWindow):
             self.close()
 
     def apply_credentials(self, credentials: Credentials) -> None:
-        self.username.setText(credentials.username)
-        self.password.setText(credentials.password)
-        self.operator.setCurrentText(credentials.operator)
+        operator = canonical_operator(credentials.operator)
+        with QSignalBlocker(self.username), QSignalBlocker(self.password), QSignalBlocker(self.operator):
+            self.username.setText(credentials.username)
+            self.password.setText(credentials.password)
+            self.operator.setCurrentIndex(self.operator.findText(operator))
 
     def credentials(self) -> Credentials:
         result = Credentials(self.username.text().strip(), self.password.text(), self.operator.currentText().strip())
@@ -486,7 +548,9 @@ class LoginWindow(QMainWindow):
             return
         try:
             self.apply_credentials(read_account_file(Path(filename)))
-            self.show_status("账号文件已导入。", True)
+            if not self.autosave_account():
+                return
+            self.show_status("账号文件已导入并保存到本机。" if self.remember.isChecked() else "账号文件已导入。", True)
         except (LoginError, OSError, UnicodeError) as exc:
             message = str(exc) if isinstance(exc, LoginError) else "无法读取账号文件，请检查文件格式。"
             self.show_status(message, False)
@@ -526,7 +590,7 @@ class LoginWindow(QMainWindow):
             self.show_status(str(exc), False)
             return
         except OSError:
-            self.show_status("无法保存配置。请取消“保存到本机”后重试。", False)
+            self.show_status("无法保存配置。请取消“自动保存到本机”后重试。", False)
             return
         self.persist_preferences()
         self.automatic_attempt = automatic
@@ -608,12 +672,15 @@ def main() -> int:
         return self_check(app, Path(sys.argv[2]))
     shortcut_created = ensure_desktop_shortcut()
     instance = SingleInstance()
-    if not instance.acquire():
+    if not instance.acquire(show_existing="--startup" not in sys.argv):
         return 0
     window = LoginWindow()
     instance.show_requested.connect(window.show_window)
     if not shortcut_created:
         window.append_log("桌面快捷方式未能创建，可继续使用程序。")
+    if window.startup.isChecked():
+        # 便携程序移动后从新位置运行，可更新已有启动项的路径。
+        window.toggle_startup(True)
     background_ready = False
     if "--background" in sys.argv and window.auto_login.isChecked() and window.tray is not None:
         try:
@@ -632,7 +699,7 @@ def self_check(app: QApplication, output: Path) -> int:
     import tempfile
     from playwright.sync_api import sync_playwright
     result = {"qt": False, "edge": False, "config_beside_exe": False,
-              "tray_menu": False, "tray_restore": False}
+              "tray_menu": False, "tray_restore": False, "operator_select": False, "autosave": False}
     for key in ("CAMPUS_USERNAME", "CAMPUS_PASSWORD", "CAMPUS_OPERATOR"):
         os.environ.pop(key, None)
     try:
@@ -641,6 +708,11 @@ def self_check(app: QApplication, output: Path) -> int:
             window.show()
             app.processEvents()
             result["qt"] = window.isVisible() and window.password.echoMode() == QLineEdit.EchoMode.Password
+            result["operator_select"] = not window.operator.isEditable() and window.operator.count() == len(OPERATORS)
+            window.username.setText("packaged-test-user")
+            window.password.setText("packaged-test-password")
+            window.operator.setCurrentIndex(1)
+            result["autosave"] = read_config(window.config_path)["CAMPUS_PASSWORD"] == "packaged-test-password"
             window.tray_menu = window.create_tray_menu()
             result["tray_menu"] = (window.tray_menu.actions()[0].text() == "打开窗口"
                                    and window.tray_menu.palette().color(QPalette.ColorRole.Window).name() == "#ffffff")
