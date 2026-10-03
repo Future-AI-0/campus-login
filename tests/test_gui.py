@@ -18,6 +18,7 @@ from PySide6.QtWidgets import QApplication, QLineEdit
 
 from gui import LoginWindow, read_account_file, read_config, save_config, OPERATORS
 from login import Credentials, LoginCancelled, LoginError, LoginPending, PORTAL_URL
+from network import CampusAdapter, AdapterProbe
 
 
 class GuiTests(unittest.TestCase):
@@ -30,8 +31,13 @@ class GuiTests(unittest.TestCase):
         self.path = Path(self.temp.name) / ".env"
         self.env_patch = patch.dict(os.environ, {"CAMPUS_USERNAME": "", "CAMPUS_PASSWORD": "", "CAMPUS_OPERATOR": ""})
         self.env_patch.start()
-        self.internet_patch = patch('gui.internet_available', return_value=None)
+        self.internet_patch = patch('network.internet_available', return_value=None)
         self.internet_patch.start()
+        self.adapter = CampusAdapter(3, '10.0.0.2', ())
+        self.adapter_patch = patch('gui.available_adapters', return_value=(self.adapter,))
+        self.adapter_patch.start()
+        self.scan_adapter_patch = patch('network.available_adapters', return_value=(self.adapter,))
+        self.scan_adapter_patch.start()
         self.window = LoginWindow(config_path=self.path, background_services=False)
 
     def tearDown(self):
@@ -43,6 +49,8 @@ class GuiTests(unittest.TestCase):
             self.wait_until(lambda: self.window.shortcut_worker is None)
         self.env_patch.stop()
         self.internet_patch.stop()
+        self.adapter_patch.stop()
+        self.scan_adapter_patch.stop()
         self.temp.cleanup()
 
     def wait_until(self, condition, timeout=4):
@@ -145,7 +153,7 @@ class GuiTests(unittest.TestCase):
     def test_automatic_login_waits_while_account_is_being_edited(self):
         self.fill()
         self.window.password.setText("new-password")
-        with patch("gui.run_login", return_value="校园网已连接。") as run, patch("gui.probe_reachable") as probe:
+        with patch("gui.run_login", return_value="校园网已连接。") as run, patch("network.portal_reachable") as probe:
             self.window.check_portal()
             self.window.on_probe_result(True)
             run.assert_not_called()
@@ -214,6 +222,63 @@ class GuiTests(unittest.TestCase):
         with self.assertRaises(LoginError):
             self.window.remember_entry('https://example.test/login')
         self.assertEqual(self.window.entry_url.text(), entry)
+
+    def test_online_ethernet_skips_wifi_authentication(self):
+        self.prepare_saved_account()
+        wifi = CampusAdapter(11, '10.0.0.3', (), 'wifi')
+        with patch('gui.available_adapters', return_value=(self.adapter, wifi)), patch('gui.run_login', return_value='校园网已联网（HTTPS 验证通过）。') as login:
+            self.window.on_adapters_result((AdapterProbe(self.adapter, True, True), AdapterProbe(wifi, True, None)))
+            self.wait_until(lambda: self.window.worker is None)
+        login.assert_not_called()
+        self.assertIn('以太网', self.window.status.text())
+        self.assertFalse(hasattr(self.window, 'network_mode'))
+
+    def test_stale_disconnected_adapter_probe_does_not_start_login(self):
+        self.prepare_saved_account()
+        with patch('gui.available_adapters', return_value=()), patch('gui.run_login') as login:
+            self.window.on_adapters_result((AdapterProbe(self.adapter, True, None),))
+        login.assert_not_called()
+
+    def test_ethernet_cooldown_does_not_switch_to_reachable_wifi(self):
+        self.prepare_saved_account()
+        wifi = CampusAdapter(11, '10.0.0.3', (), 'wifi')
+        from background import AutoLoginPolicy
+        self.window.adapter_policies[(self.adapter.index, self.adapter.address)] = AutoLoginPolicy(next_attempt=time.monotonic() + 300)
+        with patch('gui.available_adapters', return_value=(self.adapter, wifi)), patch('gui.run_login', return_value='校园网已连接。') as login:
+            self.window.on_adapters_result((AdapterProbe(self.adapter, True, None), AdapterProbe(wifi, True, None)))
+            self.wait_until(lambda: self.window.worker is None)
+        login.assert_not_called()
+        self.assertIn('以太网', self.window.status.text())
+
+    def test_ethernet_priority_even_when_wifi_is_verified_and_listed_first(self):
+        self.prepare_saved_account()
+        wifi = CampusAdapter(11, '10.0.0.3', (), 'wifi')
+        with patch('gui.available_adapters', return_value=(wifi, self.adapter)), patch('gui.run_login', return_value='校园网已连接。') as login:
+            self.window.on_adapters_result((AdapterProbe(wifi, True, True), AdapterProbe(self.adapter, True, None)))
+            self.wait_until(lambda: self.window.worker is None)
+        self.assertEqual(login.call_args.kwargs['adapter'], self.adapter)
+
+    def test_wifi_fallback_when_ethernet_portal_is_unreachable(self):
+        self.prepare_saved_account()
+        wifi = CampusAdapter(11, '10.0.0.3', (), 'wifi')
+        with patch('gui.available_adapters', return_value=(self.adapter, wifi)), patch('gui.run_login', return_value='校园网已连接。') as login:
+            self.window.on_adapters_result((AdapterProbe(self.adapter, False, None), AdapterProbe(wifi, True, None)))
+            self.wait_until(lambda: self.window.worker is None)
+        self.assertEqual(login.call_args.kwargs['adapter'], wifi)
+
+    def test_all_verified_cards_and_unreachable_hotspot_skip_authentication(self):
+        self.prepare_saved_account()
+        wifi = CampusAdapter(11, '192.168.1.2', (), 'wifi')
+        with patch('gui.available_adapters', return_value=(self.adapter, wifi)), patch('gui.run_login') as login:
+            self.window.on_adapters_result((AdapterProbe(self.adapter, True, True), AdapterProbe(wifi, False, None)))
+        login.assert_not_called()
+        self.assertTrue(self.window.internet_online)
+
+    def test_dhcp_address_change_does_not_reuse_old_entry_parameters(self):
+        self.window.active_adapter = self.adapter
+        self.window.remember_entry('http://10.254.241.66/eportal/index.jsp?wlanuserip=example')
+        self.assertEqual(self.window.current_entry(CampusAdapter(11, '10.0.0.3', (), 'wifi')), PORTAL_URL)
+        self.assertEqual(self.window.entry_address, '')
 
     def test_shortcut_creation_does_not_block_ui_and_exit_waits(self):
         def fake_shortcut():
@@ -309,10 +374,10 @@ class GuiTests(unittest.TestCase):
 
     def test_probe_runs_in_background_and_only_one_probe_at_a_time(self):
         self.prepare_saved_account()
-        def fake_probe(url):
+        def fake_probe(url, **kwargs):
             time.sleep(.15)
             return False
-        with patch("gui.probe_reachable", side_effect=fake_probe) as probe:
+        with patch("network.portal_reachable", side_effect=fake_probe) as probe:
             self.window.check_portal()
             self.window.check_portal()
             self.assertIsNotNone(self.window.probe_worker)
@@ -356,10 +421,10 @@ class GuiTests(unittest.TestCase):
         self.window.close()
         self.assertFalse(self.window.isVisible())
         self.assertFalse(self.window.quitting)
-        def fake_probe(url):
+        def fake_probe(url, **kwargs):
             time.sleep(.2)
             return False
-        with patch("gui.probe_reachable", side_effect=fake_probe):
+        with patch("network.portal_reachable", side_effect=fake_probe):
             self.window.check_portal()
             self.window.request_exit()
             self.assertTrue(self.window.close_pending)

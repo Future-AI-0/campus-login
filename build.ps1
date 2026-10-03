@@ -33,10 +33,13 @@ try {
 } finally {
     $env:PATH = $taskOriginalPath
 }
-if ($taskBuildExitCode -ne 0) { exit $taskBuildExitCode }
 foreach ($taskConfigName in $taskPrivateConfig.Keys) {
+    if (-not (Test-Path -LiteralPath $taskRelease -PathType Container)) {
+        New-Item -ItemType Directory -Path $taskRelease -Force | Out-Null
+    }
     [IO.File]::WriteAllBytes((Join-Path $taskRelease $taskConfigName), $taskPrivateConfig[$taskConfigName])
 }
+if ($taskBuildExitCode -ne 0) { exit $taskBuildExitCode }
 if ($SingleFile) {
     Copy-Item -LiteralPath '使用说明-单文件版.txt' -Destination (Join-Path $taskRelease '使用说明.txt') -Force
     $taskZipFiles = @((Join-Path $taskRelease 'CampusLogin.exe'), (Join-Path $taskRelease '使用说明.txt'))

@@ -22,9 +22,12 @@ class PortalRedirectHandler(HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def probe_reachable(url: str, timeout: float = 3) -> bool:
+def probe_reachable(url: str, timeout: float = 3, *, adapter=None) -> bool:
     """只检查校园网 HTTP 响应，不发账号、不使用显式代理、不探测公网。"""
     validate_url(url)
+    if adapter is not None:
+        from network import portal_reachable
+        return portal_reachable(url, adapter, timeout)
     request = Request(url, headers={"User-Agent": "CampusLogin/1.0", "Cache-Control": "no-cache"})
     opener = build_opener(ProxyHandler({}), PortalRedirectHandler())
     try:
@@ -61,7 +64,8 @@ class AutoLoginPolicy:
 
 
 def load_preferences(path: Path) -> dict:
-    defaults = {"auto_login": True, "entry_url": PORTAL_URL, "timeout": 45, "show_browser": True}
+    defaults = {"auto_login": True, "entry_url": PORTAL_URL, "timeout": 45, "show_browser": True,
+                "entry_address": ""}
     try:
         values = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(values, dict):
@@ -74,6 +78,8 @@ def load_preferences(path: Path) -> dict:
             defaults["entry_url"] = values["entry_url"]
         if isinstance(values.get("timeout"), int) and 1 <= values["timeout"] <= 300:
             defaults["timeout"] = values["timeout"]
+        if isinstance(values.get("entry_address"), str):
+            defaults["entry_address"] = values["entry_address"]
     except (OSError, ValueError, RuntimeError):
         pass
     return defaults

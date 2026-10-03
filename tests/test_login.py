@@ -41,9 +41,58 @@ SERVICES = """
 class LoginConnectivityTests(unittest.TestCase):
     credentials = Credentials('test-user', 'test-password', '中国电信')
 
+    def setUp(self):
+        from network import CampusAdapter
+        self.adapter = CampusAdapter(11, '10.0.0.2', (), 'wifi')
+        self.adapter_patch = patch('network.campus_adapter', return_value=self.adapter)
+        self.adapter_patch.start()
+        from network import AdapterProbe
+        self.scan_patch = patch('network.probe_adapters', return_value=(AdapterProbe(self.adapter, True, None),))
+        self.scan_patch.start()
+
+    def tearDown(self):
+        self.adapter_patch.stop()
+        self.scan_patch.stop()
+
+    def test_browser_and_all_network_checks_use_selected_wifi(self):
+        with patch('network.internet_available', side_effect=[None, True]) as verify, patch('login.sync_playwright') as factory, patch('bridge.CampusProxy') as proxy, patch('network.resolve_entry', return_value=None) as resolve, patch('login.automate') as automate_mock:
+            proxy.return_value.__enter__.return_value = {'server': 'http://127.0.0.1:12345'}
+            def automation(*args):
+                args[7]('http://123.123.123.123/', 3)
+                return '校园网已连接。'
+            automate_mock.side_effect = automation
+            self.assertIn('HTTPS', run_login(self.credentials, network_mode='wifi'))
+            proxy.assert_called_once_with(self.adapter)
+            launch = factory.return_value.__enter__.return_value.chromium.launch
+            self.assertEqual(launch.call_args.kwargs['proxy']['server'], 'http://127.0.0.1:12345')
+            self.assertNotIn('--no-proxy-server', launch.call_args.kwargs.get('args', []))
+            self.assertTrue(all(call.kwargs['adapter'] == self.adapter for call in verify.call_args_list))
+            self.assertEqual(resolve.call_args.kwargs['adapter'], self.adapter)
+
     def test_verified_internet_skips_browser_and_credentials(self):
         with patch('network.internet_available', return_value=True), patch('login.sync_playwright') as browser:
             self.assertIn('无需重复登录', run_login(self.credentials))
+            browser.assert_not_called()
+
+    def test_online_ethernet_skips_pending_wifi_and_browser(self):
+        from network import CampusAdapter, AdapterProbe
+        ethernet = CampusAdapter(3, '10.0.0.3', ())
+        with patch('network.probe_adapters', return_value=(AdapterProbe(ethernet, True, True), AdapterProbe(self.adapter, True, None))), patch('login.sync_playwright') as browser, patch('bridge.CampusProxy') as proxy:
+            self.assertIn('HTTPS', run_login(self.credentials))
+            proxy.assert_not_called()
+            browser.assert_not_called()
+
+    def test_unknown_ethernet_is_selected_even_when_wifi_is_verified(self):
+        from network import CampusAdapter, AdapterProbe
+        ethernet = CampusAdapter(3, '10.0.0.3', ())
+        with patch('network.probe_adapters', return_value=(AdapterProbe(self.adapter, True, True), AdapterProbe(ethernet, True, None))), patch('network.internet_available', side_effect=[None, True]), patch('login.sync_playwright'), patch('bridge.CampusProxy') as proxy, patch('login.automate', return_value='校园网已连接。'):
+            self.assertIn('HTTPS', run_login(self.credentials))
+            proxy.assert_called_once_with(ethernet)
+
+    def test_no_reachable_adapter_never_starts_browser(self):
+        with patch('network.probe_adapters', return_value=()), patch('login.sync_playwright') as browser:
+            with self.assertRaises(LoginPending):
+                run_login(self.credentials)
             browser.assert_not_called()
 
     def test_portal_online_without_external_proof_is_pending_and_browser_closed(self):

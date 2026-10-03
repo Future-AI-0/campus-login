@@ -18,14 +18,14 @@ from PySide6.QtWidgets import (
     QProgressBar, QPushButton, QSpinBox, QStyle, QSystemTrayIcon, QVBoxLayout, QWidget,
 )
 
-from background import AutoLoginPolicy, PROBE_INTERVAL_MS, load_preferences, probe_reachable, save_preferences
+from background import AutoLoginPolicy, PROBE_INTERVAL_MS, load_preferences, save_preferences
 from desktop import SingleInstance, ensure_desktop_shortcut, set_startup, startup_enabled
 from login import (
     BrowserError, Credentials, LoginCancelled, LoginError, LoginPending, PORTAL_URL,
     ROOT, redact, run_login, validate_url,
 )
 
-from network import internet_available
+from network import CampusAdapter, available_adapters, probe_adapters, preferred_probe
 
 OPERATORS = ("中国移动", "中国联通", "中国电信", "校园网")
 
@@ -89,13 +89,15 @@ class LoginWorker(QThread):
     progress = Signal(str)
     result = Signal(bool, str)
     entry_found = Signal(str)
+    adapter_found = Signal(object)
 
-    def __init__(self, credentials: Credentials, *, url: str, timeout: int, headless: bool, parent=None):
+    def __init__(self, credentials: Credentials, *, url: str, timeout: int, headless: bool, adapter=None, parent=None):
         super().__init__(parent)
         self.credentials = credentials
         self.url = url
         self.timeout = timeout
         self.headless = headless
+        self.adapter = adapter
         self.cancel_event = threading.Event()
 
     def cancel(self) -> None:
@@ -110,6 +112,8 @@ class LoginWorker(QThread):
                 progress=lambda text: self.progress.emit(redact(text, self.credentials)),
                 cancelled=self.cancel_event.is_set,
                 entry_changed=self.entry_found.emit,
+                adapter=self.adapter,
+                adapter_changed=self.adapter_found.emit,
             )
             self.result.emit(True, redact(message, self.credentials))
         except LoginCancelled:
@@ -129,7 +133,7 @@ class LoginWorker(QThread):
 
 
 class ProbeWorker(QThread):
-    result = Signal(bool, object)
+    result = Signal(object)
 
     def __init__(self, url: str, parent=None):
         super().__init__(parent)
@@ -137,12 +141,10 @@ class ProbeWorker(QThread):
 
     def run(self) -> None:
         try:
-            verified = internet_available()
-            reachable = verified is True or probe_reachable(self.url)
+            checks = probe_adapters(self.url)
         except Exception:
-            reachable = False
-            verified = None
-        self.result.emit(reachable, verified)
+            checks = ()
+        self.result.emit(checks)
 
 class ShortcutWorker(QThread):
     result = Signal(bool)
@@ -187,8 +189,13 @@ class LoginWindow(QMainWindow):
         self.config_path = config_path or ROOT / ".env"
         self.settings_path = self.config_path.with_name("settings.json")
         self.preferences = load_preferences(self.settings_path)
+        self.entry_address = self.preferences["entry_address"]
         self.background_services = background_services
         self.policy = AutoLoginPolicy()
+        self.adapter_policies = {}
+        self.adapter_online = set()
+        self.adapter_unconfirmed = {}
+        self.active_adapter = None
         self.account_edited_at = 0.0
         self.worker: LoginWorker | None = None
         self.probe_worker: ProbeWorker | None = None
@@ -208,7 +215,7 @@ class LoginWindow(QMainWindow):
         self.activation_timer.timeout.connect(self.activate_restored_window)
         self.setWindowTitle("校园网登录")
         self.setMinimumWidth(510)
-        self.resize(550, 775)
+        self.resize(550, 730)
         self.setStyleSheet(STYLE)
 
         container = QWidget()
@@ -352,6 +359,7 @@ class LoginWindow(QMainWindow):
         self.monitor_timer.timeout.connect(self.check_portal)
         self.auto_login.toggled.connect(self.toggle_monitoring)
         self.entry_url.editingFinished.connect(self.persist_preferences)
+        self.entry_url.textEdited.connect(lambda text: setattr(self, "entry_address", ""))
         self.timeout.valueChanged.connect(self.persist_preferences)
         self.show_browser.toggled.connect(self.persist_preferences)
         if self.background_services:
@@ -455,7 +463,8 @@ class LoginWindow(QMainWindow):
             url = self.entry_url.text().strip()
             validate_url(url)
             values = {"auto_login": self.auto_login.isChecked(), "entry_url": url,
-                      "timeout": self.timeout.value(), "show_browser": self.show_browser.isChecked()}
+                      "timeout": self.timeout.value(), "show_browser": self.show_browser.isChecked(),
+                      "entry_address": self.entry_address}
             save_preferences(self.settings_path, values)
             self.preferences = values
         except (OSError, LoginError):
@@ -488,6 +497,7 @@ class LoginWindow(QMainWindow):
                 self.username.text().strip(), self.password.text(), self.operator.currentText(),
             ))
             self.policy = AutoLoginPolicy()
+            self.adapter_policies.clear()
             return True
         except OSError:
             self.show_status("无法自动保存配置，请确认程序文件夹可以写入。", False)
@@ -516,15 +526,67 @@ class LoginWindow(QMainWindow):
             return
         try:
             self.saved_credentials()
-            url = self.entry_url.text().strip()
+            url = self.current_entry()
             validate_url(url)
         except (LoginError, OSError, UnicodeError):
             self.status.setText("静默检测等待配置：请填写并保存账号信息。")
             return
         self.probe_worker = ProbeWorker(url, self)
-        self.probe_worker.result.connect(self.on_probe_result)
+        self.probe_worker.result.connect(self.on_adapters_result)
         self.probe_worker.finished.connect(self.probe_finished)
         self.probe_worker.start()
+
+    @Slot(object)
+    def on_adapters_result(self, checks) -> None:
+        if self.quitting or not self.auto_login.isChecked() or self.worker is not None:
+            return
+        if time.monotonic() - self.account_edited_at < 2.5:
+            return
+        live = {(item.index, item.address) for item in available_adapters()}
+        checks = [item for item in checks if (item.adapter.index, item.adapter.address) in live]
+        self.adapter_policies = {key: value for key, value in self.adapter_policies.items() if key in live}
+        self.adapter_online.intersection_update(live)
+        self.adapter_unconfirmed = {key: value for key, value in self.adapter_unconfirmed.items() if key in live}
+        now = time.monotonic()
+        selected = preferred_probe(checks)
+        label = "以太网" if selected is not None and selected.adapter.kind == "ethernet" else "Wi-Fi"
+        due = []
+        for item in checks:
+            key = (item.adapter.index, item.adapter.address)
+            policy = self.adapter_policies.setdefault(key, AutoLoginPolicy())
+            if item != selected:
+                if not item.reachable:
+                    policy.probe(False, now)
+                continue
+            if item.verified is True:
+                self.adapter_online.add(key)
+                self.adapter_unconfirmed.pop(key, None)
+                policy.completed(True, now)
+                continue
+            if key in self.adapter_online:
+                count = self.adapter_unconfirmed.get(key, 0) + 1
+                self.adapter_unconfirmed[key] = count
+                if count < 2:
+                    continue
+                self.adapter_online.discard(key)
+                policy.next_attempt = 0
+            if policy.probe(item.reachable, now):
+                due.append(item)
+        if due:
+            # 只有优先通道参与认证，以太网冷却时也不切到可达的 Wi-Fi。
+            item = min(due, key=lambda item: self.adapter_policies[(item.adapter.index, item.adapter.address)].next_attempt)
+            self.internet_online = False
+            self.start_login(automatic=True, adapter=item.adapter)
+        elif selected is not None and selected.verified is True:
+            self.internet_online = True
+            message = f"已自动选择{label}，已联网（HTTPS 验证通过）。"
+            if self.status.text() != message:
+                self.show_status(message, True)
+        elif selected is not None:
+            self.show_pending(f"已自动选择{label}，联网状态待确认，继续后台检测。")
+        else:
+            self.internet_online = False
+            self.show_pending("等待校园网入口：正在自动检测 Wi-Fi 和有线网卡。")
 
     @Slot(bool, object)
     def on_probe_result(self, reachable: bool, verified: bool | None = None) -> None:
@@ -604,8 +666,17 @@ class LoginWindow(QMainWindow):
         if self.quitting:
             return
         validate_url(entry)
+        adapter = self.active_adapter
+        self.entry_address = adapter.address if adapter is not None else ""
         self.entry_url.setText(entry)
         self.persist_preferences()
+
+    def current_entry(self, adapter=None) -> str:
+        if self.entry_address and (adapter is None or adapter.address != self.entry_address):
+            self.entry_url.setText(PORTAL_URL)
+            self.entry_address = ""
+            self.persist_preferences()
+        return self.entry_url.text().strip()
 
     def toggle_advanced(self) -> None:
         visible = not self.advanced_panel.isVisible()
@@ -647,12 +718,12 @@ class LoginWindow(QMainWindow):
         self.busy.setVisible(busy)
         self.login_button.setText("正在连接…" if busy else "连接校园网")
 
-    def start_login(self, *, automatic: bool = False) -> None:
+    def start_login(self, *, automatic: bool = False, adapter=None) -> None:
         if self.worker is not None or self.quitting:
             return
         try:
             credentials = self.saved_credentials() if automatic else self.credentials()
-            url = self.entry_url.text().strip()
+            url = self.current_entry(adapter)
             validate_url(url)
             if not automatic and self.remember.isChecked():
                 save_config(self.config_path, credentials)
@@ -670,7 +741,9 @@ class LoginWindow(QMainWindow):
         self.set_busy(True)
         if self.tray:
             self.tray.setToolTip("校园网登录 · 正在连接")
-        self.worker = LoginWorker(credentials, url=url, timeout=self.timeout.value(), headless=automatic or not self.show_browser.isChecked(), parent=self)
+        self.active_adapter = adapter
+        self.worker = LoginWorker(credentials, url=url, timeout=self.timeout.value(), headless=automatic or not self.show_browser.isChecked(), adapter=adapter, parent=self)
+        self.worker.adapter_found.connect(lambda value: setattr(self, "active_adapter", value))
         self.worker.progress.connect(self.append_log)
         self.worker.entry_found.connect(self.remember_entry)
         self.worker.result.connect(self.on_result)
@@ -680,6 +753,11 @@ class LoginWindow(QMainWindow):
     @Slot(bool, str)
     def on_result(self, success: bool, message: str) -> None:
         self.policy.completed(success, time.monotonic())
+        if self.active_adapter is not None:
+            key = (self.active_adapter.index, self.active_adapter.address)
+            self.adapter_policies.setdefault(key, AutoLoginPolicy()).completed(success, time.monotonic())
+            if success:
+                self.adapter_online.add(key)
         if not success and "继续后台检测" in message:
             self.show_pending(message)
         else:
@@ -708,6 +786,8 @@ class LoginWindow(QMainWindow):
         if worker is not None:
             worker.deleteLater()
         self.automatic_attempt = False
+        if self.background_services and self.auto_login.isChecked() and not self.quitting:
+            QTimer.singleShot(500, self.check_portal)
         if self.close_pending:
             self.close()
 
@@ -774,7 +854,8 @@ def self_check(app: QApplication, output: Path) -> int:
     import tempfile
     from playwright.sync_api import sync_playwright
     result = {"qt": False, "edge": False, "config_beside_exe": False,
-              "tray_menu": False, "tray_restore": False, "operator_select": False, "autosave": False}
+              "tray_menu": False, "tray_restore": False, "operator_select": False, "autosave": False,
+              "automatic_network": False}
     for key in ("CAMPUS_USERNAME", "CAMPUS_PASSWORD", "CAMPUS_OPERATOR"):
         os.environ.pop(key, None)
     try:
@@ -784,6 +865,7 @@ def self_check(app: QApplication, output: Path) -> int:
             app.processEvents()
             result["qt"] = window.isVisible() and window.password.echoMode() == QLineEdit.EchoMode.Password
             result["operator_select"] = not window.operator.isEditable() and window.operator.count() == len(OPERATORS)
+            result["automatic_network"] = not hasattr(window, "network_mode") and callable(probe_adapters)
             window.username.setText("packaged-test-user")
             window.password.setText("packaged-test-password")
             window.operator.setCurrentIndex(1)

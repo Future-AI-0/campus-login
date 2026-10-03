@@ -8,6 +8,7 @@ import re
 import sys
 import time
 from collections.abc import Callable
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -359,32 +360,62 @@ def run_login(
     progress: Callable[[str], None] | None = None,
     cancelled: Callable[[], bool] | None = None,
     entry_changed: Callable[[str], None] | None = None,
+    network_mode: str = "auto",
+    adapter=None,
+    adapter_changed: Callable[[object], None] | None = None,
 ) -> str:
     """每次在调用线程创建独立的 Playwright 和浏览器，CLI/Qt 共用。"""
     validate_url(url)
     if any(not value.strip() for value in (credentials.username, credentials.password, credentials.operator)):
         raise LoginError("请填写账号、密码和运营商。")
     report = progress or (lambda message: print(message, flush=True))
-    from network import internet_available, resolve_entry
+    from network import campus_adapter, internet_available, resolve_entry, probe_adapters, preferred_probe, IDLE_INTERNET_TIMEOUT
+    from bridge import CampusProxy
     if cancelled is not None and cancelled():
         raise LoginCancelled("已取消登录。")
+    if adapter is None and network_mode == "auto" and sys.platform == "win32":
+        report("正在分别检测 Wi-Fi 和有线网卡的校园网入口…")
+        checks = probe_adapters(url, min(timeout, IDLE_INTERNET_TIMEOUT))
+        if cancelled is not None and cancelled():
+            raise LoginCancelled("已取消登录。")
+        selected = preferred_probe(checks)
+        if selected is None:
+            raise LoginPending("所有可用网卡均暂未找到校园网入口，继续后台检测。")
+        label = "以太网" if selected.adapter.kind == "ethernet" else "Wi-Fi"
+        report("已自动选择校园网通道：" + label + "（以太网优先）")
+        if selected.verified is True and not dry_run:
+            return label + "已联网（HTTPS 验证通过），无需重复登录。"
+        return run_login(credentials, url=url, timeout=timeout, headless=headless,
+                         dry_run=dry_run, progress=report, cancelled=cancelled,
+                         entry_changed=entry_changed, adapter=selected.adapter,
+                         adapter_changed=adapter_changed)
+    adapter = adapter or campus_adapter(network_mode)
+    if adapter is None and sys.platform == "win32":
+        raise LoginPending("选择的校园网通道当前不可用；请检查 Wi-Fi 或网线连接，继续后台检测。")
+    if adapter_changed is not None:
+        adapter_changed(adapter)
+    report("校园网通道：" + ("Wi-Fi" if adapter is not None and adapter.kind == "wifi" else "网线"))
     if not dry_run:
         report("正在核实校园网网卡的联网状态…")
-        verified = internet_available(min(timeout, 6))
+        verified = internet_available(min(timeout, 6), adapter=adapter)
         if cancelled is not None and cancelled():
             raise LoginCancelled("已取消登录。")
         if verified is True:
             return "校园网网卡已联网（HTTPS 验证通过），无需重复登录。"
-    with sync_playwright() as p:
+    with ExitStack() as resources, sync_playwright() as p:
+        launch_options = {"headless": headless, "args": ["--no-proxy-server"]}
+        if adapter is not None:
+            launch_options = {"headless": headless, "proxy": resources.enter_context(CampusProxy(adapter))}
         try:
-            browser = p.chromium.launch(channel="msedge", headless=headless, args=["--no-proxy-server"])
+            browser = p.chromium.launch(channel="msedge", **launch_options)
         except BrowserError:
-            browser = p.chromium.launch(headless=headless, args=["--no-proxy-server"])
+            browser = p.chromium.launch(**launch_options)
         try:
             page = browser.new_page(viewport={"width": 1366, "height": 900}, locale="zh-CN")
             report("正在打开校园网认证页面…")
             try:
-                result = automate(page, credentials, timeout, dry_run, url, report, cancelled, resolve_entry, entry_changed)
+                resolver = lambda redirect, remaining: resolve_entry(redirect, remaining, adapter=adapter)
+                result = automate(page, credentials, timeout, dry_run, url, report, cancelled, resolver, entry_changed)
             except LoginError as exc:
                 if "HTTP 555" in str(exc):
                     raise LoginPending("门户入口返回 HTTP 555，认证状态待确认；继续后台检测。") from None
@@ -392,7 +423,7 @@ def run_login(
             if dry_run:
                 return result
             report("门户已报告在线，正在确认校园网网卡的外网连通性…")
-            verified = internet_available(min(timeout, 6))
+            verified = internet_available(min(timeout, 6), adapter=adapter)
             if cancelled is not None and cancelled():
                 raise LoginCancelled("已取消登录。")
             if verified is True:
@@ -415,6 +446,7 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="填写界面但不提交认证")
     parser.add_argument("--timeout", type=positive_seconds, default=45, help="认证等待秒数，默认 45")
     parser.add_argument("--url", default=PORTAL_URL, help="覆盖失效入口，使用校园网重新生成的完整 URL")
+    parser.add_argument("--network", choices=("auto", "wifi", "ethernet"), default="auto", help="校园网通道，默认自动")
     args = parser.parse_args()
     try:
         validate_url(args.url)
@@ -423,7 +455,7 @@ def main() -> int:
     credentials = None
     try:
         credentials = Credentials.from_environment()
-        result = run_login(credentials, url=args.url, timeout=args.timeout, headless=args.headless, dry_run=args.dry_run)
+        result = run_login(credentials, url=args.url, timeout=args.timeout, headless=args.headless, dry_run=args.dry_run, network_mode=args.network)
         print(result, flush=True)
         return 0
     except LoginError as exc:
