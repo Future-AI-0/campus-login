@@ -136,6 +136,12 @@ class ProbeWorker(QThread):
             reachable = False
         self.result.emit(reachable)
 
+class ShortcutWorker(QThread):
+    result = Signal(bool)
+
+    def run(self) -> None:
+        self.result.emit(ensure_desktop_shortcut())
+
 
 STYLE = """
 QMainWindow { background: #f3f6fb; }
@@ -178,6 +184,7 @@ class LoginWindow(QMainWindow):
         self.account_edited_at = 0.0
         self.worker: LoginWorker | None = None
         self.probe_worker: ProbeWorker | None = None
+        self.shortcut_worker: ShortcutWorker | None = None
         self.automatic_attempt = False
         self.tray: QSystemTrayIcon | None = None
         self.tray_menu: QMenu | None = None
@@ -355,6 +362,26 @@ class LoginWindow(QMainWindow):
         self.tray.activated.connect(self.tray_activated)
         self.tray.show()
         QApplication.instance().setQuitOnLastWindowClosed(False)
+
+    def update_desktop_shortcut(self) -> None:
+        if self.quitting or self.shortcut_worker is not None:
+            return
+        self.shortcut_worker = ShortcutWorker(self)
+        self.shortcut_worker.result.connect(self.on_shortcut_result)
+        self.shortcut_worker.finished.connect(self.shortcut_finished)
+        self.shortcut_worker.start()
+
+    @Slot(bool)
+    def on_shortcut_result(self, success: bool) -> None:
+        if not success:
+            self.append_log("桌面快捷方式未能创建，可继续使用程序。")
+
+    def shortcut_finished(self) -> None:
+        worker, self.shortcut_worker = self.shortcut_worker, None
+        if worker is not None:
+            worker.deleteLater()
+        if self.close_pending:
+            self.close()
 
     def create_tray_menu(self) -> QMenu:
         menu = QMenu(self)
@@ -653,7 +680,7 @@ class LoginWindow(QMainWindow):
         if self.worker is not None:
             self.worker.cancel()
             self.status.setText("正在退出，等待浏览器关闭…")
-        if self.worker is not None or self.probe_worker is not None:
+        if self.worker is not None or self.probe_worker is not None or self.shortcut_worker is not None:
             self.close_pending = True
             event.ignore()
         else:
@@ -670,19 +697,16 @@ def main() -> int:
     app.setFont(QFont("Microsoft YaHei UI", 10))
     if len(sys.argv) == 3 and sys.argv[1] == "--self-check":
         return self_check(app, Path(sys.argv[2]))
-    shortcut_created = ensure_desktop_shortcut()
     instance = SingleInstance()
     if not instance.acquire(show_existing="--startup" not in sys.argv):
         return 0
     window = LoginWindow()
     instance.show_requested.connect(window.show_window)
-    if not shortcut_created:
-        window.append_log("桌面快捷方式未能创建，可继续使用程序。")
     if window.startup.isChecked():
         # 便携程序移动后从新位置运行，可更新已有启动项的路径。
         window.toggle_startup(True)
     background_ready = False
-    if "--background" in sys.argv and window.auto_login.isChecked() and window.tray is not None:
+    if "--background" in sys.argv and window.tray is not None and (window.auto_login.isChecked() or "--startup" in sys.argv):
         try:
             window.saved_credentials()
             background_ready = True
@@ -690,6 +714,7 @@ def main() -> int:
             pass
     if not background_ready:
         window.show()
+    window.update_desktop_shortcut()
     return app.exec()
 
 

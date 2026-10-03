@@ -40,8 +40,9 @@ class LoginCancelled(LoginError):
 
 def validate_url(url: str) -> None:
     target = urlsplit(url)
-    if target.hostname != PORTAL_HOST or target.scheme not in ("http", "https") or not target.path.startswith("/portal/"):
-        raise LoginError("入口必须是 10.254.241.66 的 /portal/ 页面。")
+    valid_path = target.path.startswith("/portal/") or target.path == "/eportal/index.jsp"
+    if target.hostname != PORTAL_HOST or target.scheme not in ("http", "https") or not valid_path:
+        raise LoginError("入口必须是 10.254.241.66 的 /portal/ 页面或 /eportal/index.jsp 跳转入口。")
 
 
 def redact(message: str, credentials: Credentials) -> str:
@@ -78,7 +79,7 @@ def unique_visible(locator: Locator, description: str) -> Locator | None:
 
 def trusted_frames(page: Page) -> list[Frame]:
     # 只允许在校园网认证主机的页面和 iframe 中输入账号密码。
-    return [frame for frame in page.frames if urlsplit(frame.url).hostname == PORTAL_HOST]
+    return [frame for frame in page.frames if not frame.is_detached() and urlsplit(frame.url).hostname == PORTAL_HOST]
 
 
 def find_login_form(page: Page) -> Frame | None:
@@ -175,21 +176,28 @@ def choose_operator(page: Page, operator: str) -> Locator | None:
 class PortalStatus:
     online: bool = False
     error: str = ""
+    entry_expired: bool = False
+    terminal_redirect: str = ""
+    terminal_failures: int = 0
 
     def observe(self, response: Response) -> None:
         url = urlsplit(response.url)
         if url.hostname != PORTAL_HOST:
             return
-        # 本校门户用 HTTP 555 表示已在线；只接受入口和认证接口的响应。
+        # 555 是门户要求重新跳转，不是在线证明；在线状态需独立确认。
         if response.status == 555 and (
             url.path.startswith("/portal/") or url.path in (
                 "/eportal/adaptor/queryTerminalInfo", "/eportal/adaptor/getOnlineUserInfo",
                 "/eportal/network/serviceLogin", "/eportal/network/operatorLogin",
             )
         ):
-            self.online = True
+            self.entry_expired = True
+            self.terminal_redirect = response.headers.get("location") or "http://123.123.123.123/"
+            self.terminal_failures += 1
             return
         if url.path == "/eportal/adaptor/queryTerminalInfo":
+            if response.ok:
+                self.terminal_failures = 0
             return
         if url.path not in (
             "/eportal/adaptor/getOnlineUserInfo",
@@ -229,6 +237,11 @@ def is_connected(page: Page, status: PortalStatus) -> bool:
 def check_failure(page: Page, status: PortalStatus) -> None:
     if status.error:
         raise LoginError(status.error)
+    if status.terminal_failures >= 3:
+        raise LoginError(
+            "尚未确认校园网登录成功。门户要求重新获取入口（HTTP 555），当前认证表单未能加载。"
+            "请使用校园网自动跳转生成的完整登录地址；Mihomo/Clash 的 TUN 可能影响入口跳转。"
+        )
     if page.url.startswith("chrome-error:"):
         raise LoginError("认证页面或其跳转地址无法访问，请检查校园网连接和入口地址。")
     for frame in trusted_frames(page):
@@ -251,6 +264,7 @@ def automate(
     url: str | None = None,
     progress: Callable[[str], None] | None = None,
     cancelled: Callable[[], bool] | None = None,
+    entry_resolver: Callable[[str, float], str | None] | None = None,
 ) -> str:
     report = progress or (lambda message: print(message, flush=True))
 
@@ -262,37 +276,69 @@ def automate(
     status = PortalStatus()
     page.on("response", status.observe)
     page.set_default_timeout(min(timeout * 1000, 15000))
+    def navigate(entry: str, limit: float) -> None:
+        try:
+            page.goto(entry, wait_until="commit", timeout=limit)
+        except BrowserError as exc:
+            # 空的 555 响应会使 Chromium 报导航错误，仍应走入口刷新流程。
+            if not (status.entry_expired and "ERR_HTTP_RESPONSE_CODE_FAILURE" in str(exc)):
+                raise
     if url is not None:
         # 监听先于导航；commit 避免等待门户持续轮询造成的 networkidle。
-        page.goto(url, wait_until="commit", timeout=min(timeout * 1000, 30000))
+        navigate(url, min(timeout * 1000, 30000))
     deadline = time.monotonic() + timeout
     submitted = False
     operator_submitted = False
+    entry_refreshed = False
     while time.monotonic() < deadline:
         check_cancelled()
-        if is_connected(page, status):
-            return "校园网已连接。" if submitted or operator_submitted else "校园网当前已在线，无需重复登录。"
-        check_failure(page, status)
-        if not operator_submitted:
-            confirm = choose_operator(page, credentials.operator)
-            if confirm is not None:
-                if dry_run:
-                    return "演练完成：已选择运营商，没有点击确认。"
-                check_cancelled()
-                report("已选择运营商，正在确认连接…")
-                confirm.click()
-                operator_submitted = True
-        if not submitted and not operator_submitted:
-            frame = find_login_form(page)
-            if frame is not None:
-                button = prepare_form(frame, credentials)
-                if dry_run:
-                    return "演练完成：账号密码已填入，同意框已处理；没有提交，后续运营商步骤尚未验证。"
-                check_cancelled()
-                report("已填入账号密码并处理协议，正在提交登录…")
-                button.click()
-                submitted = True
+        try:
+            if status.error:
+                raise LoginError(status.error)
+            if is_connected(page, status):
+                return "校园网已连接。" if submitted or operator_submitted else "校园网当前已在线，无需重复登录。"
+            if status.entry_expired and not entry_refreshed and not submitted and not operator_submitted:
+                entry_refreshed = True
+                report("门户要求刷新入口，正在核实在线状态并获取新的登录地址…")
+                if entry_resolver is not None:
+                    check_cancelled()
+                    fresh_url = entry_resolver(status.terminal_redirect, max(0, deadline - time.monotonic()))
+                    if fresh_url:
+                        validate_url(fresh_url)
+                        status.entry_expired = False
+                        status.terminal_failures = 0
+                        navigate(fresh_url, min(timeout * 1000, 15000))
+                        continue
+            check_failure(page, status)
+            if not operator_submitted:
+                confirm = choose_operator(page, credentials.operator)
+                if confirm is not None:
+                    if dry_run:
+                        return "演练完成：已选择运营商，没有点击确认。"
+                    check_cancelled()
+                    report("已选择运营商，正在确认连接…")
+                    operator_submitted = True
+                    confirm.click()
+            if not submitted and not operator_submitted:
+                frame = find_login_form(page)
+                if frame is not None:
+                    button = prepare_form(frame, credentials)
+                    if dry_run:
+                        return "演练完成：账号密码已填入，同意框已处理；没有提交，后续运营商步骤尚未验证。"
+                    check_cancelled()
+                    report("已填入账号密码并处理协议，正在提交登录…")
+                    submitted = True
+                    button.click()
+        except BrowserError as exc:
+            # 认证跳转会替换 SSO iframe；暂时失效的定位在下一轮重试。
+            # 提交标记先于 click 设置，避免跳转期间重复提交密码。
+            if not any(text in str(exc) for text in (
+                "Frame was detached", "Execution context was destroyed", "Cannot find context with specified id",
+            )):
+                raise
         page.wait_for_timeout(250)
+    if status.entry_expired:
+        raise LoginError("门户入口需刷新（HTTP 555）；尚未确认校园网登录成功。请使用校园网生成的完整入口地址。")
     raise LoginError("等待校园网认证结果超时；未确认连接成功。请检查入口、账号密码和运营商。")
 
 
@@ -311,6 +357,7 @@ def run_login(
     if any(not value.strip() for value in (credentials.username, credentials.password, credentials.operator)):
         raise LoginError("请填写账号、密码和运营商。")
     report = progress or (lambda message: print(message, flush=True))
+    from network import resolve_entry
     if cancelled is not None and cancelled():
         raise LoginCancelled("已取消登录。")
     with sync_playwright() as p:
@@ -321,7 +368,7 @@ def run_login(
         try:
             page = browser.new_page(viewport={"width": 1366, "height": 900}, locale="zh-CN")
             report("正在打开校园网认证页面…")
-            return automate(page, credentials, timeout, dry_run, url, report, cancelled)
+            return automate(page, credentials, timeout, dry_run, url, report, cancelled, resolve_entry)
         finally:
             browser.close()
 

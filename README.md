@@ -2,7 +2,7 @@
 
 Windows 校园网登录工具，使用 **PySide6 / Qt** 提供界面，通过 **Playwright + Microsoft Edge** 完成网页认证。支持后台检测、自动填写账号、勾选协议、精确匹配运营商和确认连接，认证结束后关闭浏览器。
 
-默认适配 `10.254.241.66` 的校园网门户，包含 SSO iframe 和运营商二次确认流程。其他门户需要调整入口、表单定位和认证结果判断。
+默认适配 `10.254.241.66` 的校园网门户，包含网关生成的新入口、SSO iframe 和运营商二次确认流程。其他门户需要调整入口、表单定位和认证结果判断。
 
 ## 下载与使用
 
@@ -24,13 +24,17 @@ Windows 校园网登录工具，使用 **PySide6 / Qt** 提供界面，通过 **
 
 程序运行后会在桌面创建或更新“校园网登录”快捷方式，快捷方式默认静默启动；配置不完整时显示设置窗口。开机启动由界面开关控制，新安装默认关闭。移动便携程序后，从新位置手动运行一次即可更新已启用的启动项。手动重复启动会打开已有窗口，开机重复启动保持静默，避免同时认证。
 
+创建快捷方式在后台完成，先显示界面；重复启动先联系已有窗口，不再等待 PowerShell 创建快捷方式。希望启动快时优先使用精简目录版，单文件版仍需要先解压依赖。
+
 ## 自动登录行为
 
 - 自动登录始终隐藏浏览器，使用已保存的配置。默认情况下，账号、密码和运营商的修改立即自动保存；取消自动保存时，界面草稿不会用于后台登录。
 - 失败按 60、120、240、300 秒的间隔重试，之后最多每 5 分钟尝试一次；入口断开后重新可达时立即再试。
 - 每次认证只提交一次账号并等待明确结果。已在线时不再提交账号，也不切换当前运营商。
 - 明确的账号密码错误或验证码要求会暂停自动登录；点击 **取消** 也会暂停。
-- 入口可达只表示可以尝试认证。程序通过门户在线结果、登录成功页面，或本校门户入口及认证接口的 HTTP 555 确认已在线。555 不触发失败重试，普通 HTTP 200、手机热点能上网都不会被判为校园网认证成功。
+- 入口可达只表示可以尝试认证。程序通过门户在线结果或登录成功页面确认成功，运营商认证失败优先于基础在线状态。HTTP 555 不直接表示已在线，普通 HTTP 200、手机热点能上网也不会被判为校园网认证成功。
+- 遇到 555 时尝试获取新的登录入口，支持网关的 HTTP `Location` 和短 HTML / JavaScript 跳转。Windows 上，这个请求使用通往校园网门户的网卡，避免被热点或 TUN 带走；只接受原校园门户的 `/portal/` 或 `/eportal/index.jsp` 入口。每次认证最多刷新一次，不发送账号到跳转网关，不修改系统路由或代理。
+- SSO 登录后 iframe 被替换时，等待新的页面继续选择运营商，避免将正常跳转当成错误或重复提交密码。
 - 托盘菜单使用白底深色文字、蓝底白字选中项。**打开窗口** 支持初始隐藏、关闭到托盘和最小化状态。
 
 ![托盘菜单](docs/images/tray-menu.png)
@@ -53,7 +57,7 @@ GUI 优先读取本机 `.env`，缺少的键才从环境变量读取，确保修
 
 开机启动写入当前用户 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 中本程序的 `CampusLogin` 项，使用 `--background --startup` 参数；开关显示实际 Windows 启动项状态。
 
-默认入口：
+默认入口（失效时会尝试从校园网网关重新获取，也可粘贴校园网生成的完整入口）：
 
 ```text
 http://10.254.241.66/portal/entry/pc/authenticate;flowParams=undefined;from=
@@ -108,7 +112,7 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1 -SingleFile
 
 ## 验证与已知限制
 
-已通过 48 项测试，覆盖 iframe、协议勾选、延迟出现的运营商选择、已在线、认证失败、超时、Qt 后台线程、静默触发、重试、取消、配置即时保存、输入期间避免提交半截密码、固定运营商、HTTP 555 已在线、启动项读写与失败回退、托盘菜单配色、窗口恢复和跨进程单实例通信。
+已通过 59 项测试，覆盖 iframe、协议勾选、延迟出现的运营商选择、已在线、认证失败、超时、Qt 后台线程、静默触发、重试、取消、配置即时保存、输入期间避免提交半截密码、固定运营商、555 与离线状态冲突、网关入口刷新、SSO iframe 替换、后台创建快捷方式、启动项读写与失败回退、托盘菜单配色、窗口恢复和跨进程单实例通信。
 
 还验证了 Windows 托盘右键入口的初始隐藏、关闭到托盘、最小化恢复，并在独立解压目录检查了发布包的 Qt、Edge、菜单、窗口恢复和配置路径。
 
@@ -116,8 +120,10 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1 -SingleFile
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-测试使用模拟门户与测试账号，不会提交真实校园网账号。
+自动化测试使用模拟门户与测试账号，不会提交真实校园网账号。
 
-本校门户的 HTTP 555 按已登录处理；此约定仅适用于当前适配的校园门户，其他站点的 555 不会判为成功。真实账号从未登录到完成认证的端到端流程尚未完整验证；测试中的登录提交使用模拟门户和测试账号。浏览器会禁用显式 HTTP 代理，系统 TUN / VPN 和网卡路由仍可能影响访问。
+另在实际校园网以太网连接上完成了从离线到登录的验证：旧入口在线查询返回失败并出现 555，通过校园网网卡获取新入口后完成账号提交、运营商选择和确认，门户在线接口返回 `success`。还通过同一网卡独立查询 DNS、访问公网 HTTPS 并验证服务器证书，确认联网。
 
-依赖文档：[Qt for Python](https://doc.qt.io/qtforpython-6/)、[Playwright 定位](https://playwright.dev/python/docs/locators)、[Playwright 打包](https://playwright.dev/python/docs/library#pyinstaller)、[PyInstaller](https://pyinstaller.org/en/stable/)。
+555 在本校门户中是重新跳转信号，可能与明确离线同时出现。v0.1.1 曾直接将其判为已在线，导致跳过登录；请升级到 v0.1.2 或更新版本。浏览器会禁用显式 HTTP 代理，系统 TUN / VPN 仍可能影响其他访问。
+
+依赖文档：[Qt for Python](https://doc.qt.io/qtforpython-6/)、[Playwright 定位](https://playwright.dev/python/docs/locators)、[Playwright 打包](https://playwright.dev/python/docs/library#pyinstaller)、[PyInstaller](https://pyinstaller.org/en/stable/)。Windows 网卡选择依据：[GetBestInterface](https://learn.microsoft.com/en-us/windows/win32/api/iphlpapi/nf-iphlpapi-getbestinterface)、[IP_UNICAST_IF](https://learn.microsoft.com/en-us/windows/win32/winsock/ipproto-ip-socket-options)。

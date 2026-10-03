@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import json
 import unittest
+from unittest.mock import Mock, patch
 
 from playwright.sync_api import sync_playwright
 
 from login import (
+    BrowserError,
     Credentials,
     LoginError,
     PORTAL_URL,
@@ -56,7 +58,7 @@ class PortalTests(unittest.TestCase):
     def tearDown(self):
         self.context.close()
 
-    def serve(self, *, login_result="success", delayed=False, already_online=False, duplicate=False):
+    def serve(self, *, login_result="success", delayed=False, already_online=False, duplicate=False, conflicting_online=False):
         services_script = """
           window.showServices = () => {
             const show = () => {
@@ -71,6 +73,7 @@ class PortalTests(unittest.TestCase):
                 const result = await fetch('/eportal/network/serviceLogin', {
                   method:'POST', body:JSON.stringify({operator:window.selected})
                 }).then(r=>r.json());
+                await fetch('/eportal/adaptor/getOnlineUserInfo');
                 if (result.data.authResult === 'success') {
                   history.pushState({}, '', '/portal/entry/pc/loginSuccess');
                   document.body.textContent='登录成功';
@@ -107,7 +110,8 @@ class PortalTests(unittest.TestCase):
                 self.submissions.append(route.request.post_data_json)
                 route.fulfill(json={"code": 200, "data": {"authResult": login_result}})
             elif path == "/eportal/adaptor/getOnlineUserInfo":
-                route.fulfill(json={"code": 200, "data": {"portalOnlineUserInfo": {"result": "success" if already_online else "fail"}}})
+                positive = already_online or (bool(self.submissions) and (login_result == "success" or conflicting_online))
+                route.fulfill(json={"code": 200, "data": {"portalOnlineUserInfo": {"result": "success" if positive else "fail"}}})
             else:
                 route.fulfill(status=404)
         self.context.route("**/*", route_handler)
@@ -149,6 +153,12 @@ class PortalTests(unittest.TestCase):
             automate(self.page, self.credentials, 5, False, PORTAL_URL)
         self.assertEqual(len(self.submissions), 2)
 
+    def test_operator_failure_takes_precedence_over_campus_online(self):
+        self.serve(login_result="fail", conflicting_online=True)
+        with self.assertRaisesRegex(LoginError, "运营商认证失败"):
+            automate(self.page, self.credentials, 5, False, PORTAL_URL)
+        self.assertEqual(len(self.submissions), 2)
+
     def test_duplicate_visible_username_stops(self):
         self.serve(duplicate=True)
         with self.assertRaisesRegex(LoginError, "多个可见控件"):
@@ -160,21 +170,65 @@ class PortalTests(unittest.TestCase):
         with self.assertRaisesRegex(LoginError, "未确认连接成功"):
             automate(self.page, self.credentials, 1, False, PORTAL_URL)
 
-    def test_terminal_555_is_already_online_without_submission(self):
+    def test_terminal_555_does_not_override_explicit_offline(self):
         def handler(route):
             if 'queryTerminalInfo' in route.request.url:
                 route.fulfill(status=555)
+            elif 'getOnlineUserInfo' in route.request.url:
+                route.fulfill(json={'data':{'portalOnlineUserInfo':{'result':'fail'}}})
             else:
                 route.fulfill(content_type='text/html', body='''网络连接中...
-                  <script>setInterval(()=>fetch('/eportal/adaptor/queryTerminalInfo'),100)</script>''')
+                  <script>fetch('/eportal/adaptor/getOnlineUserInfo');
+                  setInterval(()=>fetch('/eportal/adaptor/queryTerminalInfo'),100)</script>''')
         self.context.route('**/*', handler)
-        result = automate(self.page, self.credentials, 4, False, PORTAL_URL)
-        self.assertIn("无需重复登录", result)
+        with self.assertRaisesRegex(LoginError, 'HTTP 555'):
+            automate(self.page, self.credentials, 4, False, PORTAL_URL)
         self.assertEqual(self.submissions, [])
 
-    def test_entry_555_is_already_online(self):
+    def test_entry_555_without_online_proof_does_not_connect(self):
         self.context.route('**/*', lambda route: route.fulfill(status=555, body="已登录"))
+        with self.assertRaisesRegex(LoginError, 'HTTP 555'):
+            automate(self.page, self.credentials, 1, False, PORTAL_URL)
+
+    def test_555_with_explicit_online_success_still_skips_login(self):
+        def handler(route):
+            if 'getOnlineUserInfo' in route.request.url:
+                route.fulfill(json={'data':{'portalOnlineUserInfo':{'result':'success'}}})
+            else:
+                route.fulfill(status=555, content_type='text/html', body="<script>fetch('/eportal/adaptor/getOnlineUserInfo')</script>")
+        self.context.route('**/*', handler)
         self.assertIn("无需重复登录", automate(self.page, self.credentials, 4, False, PORTAL_URL))
+        self.assertEqual(self.submissions, [])
+
+    def test_expired_entry_refreshes_once_and_completes_login(self):
+        self.serve()
+        fresh = PORTAL_URL + '?fresh=1'
+        self.context.route(PORTAL_URL, lambda route: route.fulfill(status=555, headers={'Location':'http://123.123.123.123'}, body='刷新入口'))
+        resolver = Mock(return_value=fresh)
+        self.assertEqual(automate(self.page, self.credentials, 8, False, PORTAL_URL, entry_resolver=resolver), "校园网已连接。")
+        resolver.assert_called_once()
+        self.assertEqual(len(self.submissions), 2)
+
+    def test_refreshed_entry_must_still_be_trusted(self):
+        self.context.route('**/*', lambda route: route.fulfill(status=555, content_type='text/html', body='刷新入口'))
+        resolver = Mock(return_value='http://example.test/portal/login')
+        with self.assertRaisesRegex(LoginError, '入口必须'):
+            automate(self.page, self.credentials, 4, False, PORTAL_URL, entry_resolver=resolver)
+        self.assertEqual(self.submissions, [])
+
+    def test_sso_frame_detaches_after_submission_without_duplicate_login(self):
+        self.serve(delayed=True)
+        from login import check_failure
+        detached = []
+        def transient_failure(page, status):
+            if self.submissions and not detached:
+                detached.append(True)
+                raise BrowserError('Locator.count: Frame was detached')
+            return check_failure(page, status)
+        with patch('login.check_failure', side_effect=transient_failure):
+            self.assertEqual(automate(self.page, self.credentials, 8, False, PORTAL_URL), "校园网已连接。")
+        self.assertTrue(detached)
+        self.assertEqual(len(self.submissions), 2)
 
     def test_unrelated_555_does_not_mark_online(self):
         def handler(route):
@@ -187,10 +241,11 @@ class PortalTests(unittest.TestCase):
         with self.assertRaisesRegex(LoginError, '未确认连接成功'):
             automate(self.page, self.credentials, 1, False, PORTAL_URL)
 
-    def test_service_555_confirms_connection(self):
-        self.serve()
+    def test_service_555_alone_does_not_confirm_connection(self):
+        self.serve(login_result="fail")
         self.context.route('**/eportal/network/serviceLogin', lambda route: route.fulfill(status=555, json={}))
-        self.assertEqual(automate(self.page, self.credentials, 5, False, PORTAL_URL), "校园网已连接。")
+        with self.assertRaisesRegex(LoginError, 'HTTP 555'):
+            automate(self.page, self.credentials, 2, False, PORTAL_URL)
 
     def test_agreement_already_checked_stays_checked(self):
         self.context.route('**/*', lambda route: route.fulfill(content_type='text/html', body=FORM))

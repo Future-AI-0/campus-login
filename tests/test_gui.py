@@ -37,6 +37,8 @@ class GuiTests(unittest.TestCase):
             self.window.worker.cancel()
             self.wait_until(lambda: self.window.worker is None)
         self.window.request_exit()
+        if self.window.shortcut_worker is not None:
+            self.wait_until(lambda: self.window.shortcut_worker is None)
         self.env_patch.stop()
         self.temp.cleanup()
 
@@ -160,6 +162,22 @@ class GuiTests(unittest.TestCase):
             self.window.startup.setChecked(True)
         self.assertFalse(self.window.startup.isChecked())
         self.assertIn("无法修改", self.window.status.text())
+
+    def test_shortcut_creation_does_not_block_ui_and_exit_waits(self):
+        def fake_shortcut():
+            time.sleep(.2)
+            return True
+        self.window.show()
+        with patch('gui.ensure_desktop_shortcut', side_effect=fake_shortcut):
+            started = time.monotonic()
+            self.window.update_desktop_shortcut()
+            self.assertLess(time.monotonic()-started, .1)
+            self.assertTrue(self.window.isVisible())
+            self.assertTrue(self.window.login_button.isEnabled())
+            self.window.request_exit()
+            self.assertTrue(self.window.close_pending)
+            self.wait_until(lambda: self.window.shortcut_worker is None)
+            self.wait_until(lambda: not self.window.isVisible())
 
     def test_login_runs_without_blocking_and_buttons_recover(self):
         self.fill()
