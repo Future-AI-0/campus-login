@@ -21,9 +21,11 @@ from PySide6.QtWidgets import (
 from background import AutoLoginPolicy, PROBE_INTERVAL_MS, load_preferences, probe_reachable, save_preferences
 from desktop import SingleInstance, ensure_desktop_shortcut, set_startup, startup_enabled
 from login import (
-    BrowserError, Credentials, LoginCancelled, LoginError, PORTAL_URL,
+    BrowserError, Credentials, LoginCancelled, LoginError, LoginPending, PORTAL_URL,
     ROOT, redact, run_login, validate_url,
 )
+
+from network import internet_available
 
 OPERATORS = ("中国移动", "中国联通", "中国电信", "校园网")
 
@@ -86,6 +88,7 @@ def friendly_error(message: str) -> str:
 class LoginWorker(QThread):
     progress = Signal(str)
     result = Signal(bool, str)
+    entry_found = Signal(str)
 
     def __init__(self, credentials: Credentials, *, url: str, timeout: int, headless: bool, parent=None):
         super().__init__(parent)
@@ -106,10 +109,13 @@ class LoginWorker(QThread):
                 headless=self.headless,
                 progress=lambda text: self.progress.emit(redact(text, self.credentials)),
                 cancelled=self.cancel_event.is_set,
+                entry_changed=self.entry_found.emit,
             )
             self.result.emit(True, redact(message, self.credentials))
         except LoginCancelled:
             self.result.emit(False, "已取消登录，浏览器已关闭。")
+        except LoginPending as exc:
+            self.result.emit(False, redact(str(exc), self.credentials))
         except LoginError as exc:
             self.result.emit(False, friendly_error(redact(str(exc), self.credentials)))
         except BrowserError:
@@ -123,7 +129,7 @@ class LoginWorker(QThread):
 
 
 class ProbeWorker(QThread):
-    result = Signal(bool)
+    result = Signal(bool, object)
 
     def __init__(self, url: str, parent=None):
         super().__init__(parent)
@@ -131,10 +137,12 @@ class ProbeWorker(QThread):
 
     def run(self) -> None:
         try:
-            reachable = probe_reachable(self.url)
+            verified = internet_available()
+            reachable = verified is True or probe_reachable(self.url)
         except Exception:
             reachable = False
-        self.result.emit(reachable)
+            verified = None
+        self.result.emit(reachable, verified)
 
 class ShortcutWorker(QThread):
     result = Signal(bool)
@@ -186,6 +194,8 @@ class LoginWindow(QMainWindow):
         self.probe_worker: ProbeWorker | None = None
         self.shortcut_worker: ShortcutWorker | None = None
         self.automatic_attempt = False
+        self.internet_online = False
+        self.unconfirmed_probes = 0
         self.tray: QSystemTrayIcon | None = None
         self.tray_menu: QMenu | None = None
         self.quitting = False
@@ -516,17 +526,34 @@ class LoginWindow(QMainWindow):
         self.probe_worker.finished.connect(self.probe_finished)
         self.probe_worker.start()
 
-    @Slot(bool)
-    def on_probe_result(self, reachable: bool) -> None:
+    @Slot(bool, object)
+    def on_probe_result(self, reachable: bool, verified: bool | None = None) -> None:
         if self.quitting or not self.auto_login.isChecked() or self.worker is not None:
             return
         # 配置立即写盘，但输入尚未停顿时不自动提交半截密码。
         if time.monotonic() - self.account_edited_at < 2.5:
             return
+        if verified is True:
+            changed = not self.internet_online or "待确认" in self.status.text()
+            self.internet_online = True
+            self.unconfirmed_probes = 0
+            self.policy.reachable = True
+            self.policy.completed(True, time.monotonic())
+            if changed:
+                self.show_status("校园网网卡已联网（HTTPS 验证通过），无需重复登录。", True)
+            return
+        if self.internet_online:
+            self.unconfirmed_probes += 1
+            self.show_pending("校园网外网连通性待确认，继续检测；探测超时不代表未登录。")
+            # 两轮无证据后再检查门户，避免单次网站超时触发登录。
+            if self.unconfirmed_probes < 2:
+                return
+            self.internet_online = False
+            self.policy.next_attempt = 0
         was_reachable = self.policy.reachable
         due = self.policy.probe(reachable, time.monotonic())
         if not reachable and was_reachable is not False:
-            self.status.setText("等待校园网入口，每 15 秒静默检测。")
+            self.status.setText("等待校园网入口：当前状态待确认，每 15 秒静默检测。")
             self.status.setStyleSheet("color: #6d7d93;")
             self.append_log("校园网入口暂不可达，继续后台检测。")
             if self.tray:
@@ -563,6 +590,22 @@ class LoginWindow(QMainWindow):
         self.append_log(message)
         if self.tray:
             self.tray.setToolTip("校园网登录 · " + ("已连接" if success else "请查看连接状态"))
+
+    def show_pending(self, message: str) -> None:
+        if self.status.text() != message:
+            self.status.setText(message)
+            self.status.setStyleSheet("color: #946b15;")
+            self.append_log(message)
+        if self.tray:
+            self.tray.setToolTip("校园网登录 · 状态待确认")
+
+    @Slot(str)
+    def remember_entry(self, entry: str) -> None:
+        if self.quitting:
+            return
+        validate_url(entry)
+        self.entry_url.setText(entry)
+        self.persist_preferences()
 
     def toggle_advanced(self) -> None:
         visible = not self.advanced_panel.isVisible()
@@ -629,6 +672,7 @@ class LoginWindow(QMainWindow):
             self.tray.setToolTip("校园网登录 · 正在连接")
         self.worker = LoginWorker(credentials, url=url, timeout=self.timeout.value(), headless=automatic or not self.show_browser.isChecked(), parent=self)
         self.worker.progress.connect(self.append_log)
+        self.worker.entry_found.connect(self.remember_entry)
         self.worker.result.connect(self.on_result)
         self.worker.finished.connect(self.worker_finished)
         self.worker.start()
@@ -636,7 +680,13 @@ class LoginWindow(QMainWindow):
     @Slot(bool, str)
     def on_result(self, success: bool, message: str) -> None:
         self.policy.completed(success, time.monotonic())
-        self.show_status(message, success)
+        if not success and "继续后台检测" in message:
+            self.show_pending(message)
+        else:
+            self.show_status(message, success)
+        if success and "HTTPS 验证通过" in message:
+            self.internet_online = True
+            self.unconfirmed_probes = 0
         if not success and self.automatic_attempt and self.auto_login.isChecked() and not self.quitting:
             if any(text in message for text in ("账号或密码错误", "用户名或密码错误", "密码不正确", "账户被锁", "验证码")):
                 self.auto_login.setChecked(False)

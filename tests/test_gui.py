@@ -17,7 +17,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QLineEdit
 
 from gui import LoginWindow, read_account_file, read_config, save_config, OPERATORS
-from login import Credentials, LoginCancelled, LoginError
+from login import Credentials, LoginCancelled, LoginError, LoginPending, PORTAL_URL
 
 
 class GuiTests(unittest.TestCase):
@@ -30,6 +30,8 @@ class GuiTests(unittest.TestCase):
         self.path = Path(self.temp.name) / ".env"
         self.env_patch = patch.dict(os.environ, {"CAMPUS_USERNAME": "", "CAMPUS_PASSWORD": "", "CAMPUS_OPERATOR": ""})
         self.env_patch.start()
+        self.internet_patch = patch('gui.internet_available', return_value=None)
+        self.internet_patch.start()
         self.window = LoginWindow(config_path=self.path, background_services=False)
 
     def tearDown(self):
@@ -40,6 +42,7 @@ class GuiTests(unittest.TestCase):
         if self.window.shortcut_worker is not None:
             self.wait_until(lambda: self.window.shortcut_worker is None)
         self.env_patch.stop()
+        self.internet_patch.stop()
         self.temp.cleanup()
 
     def wait_until(self, condition, timeout=4):
@@ -162,6 +165,55 @@ class GuiTests(unittest.TestCase):
             self.window.startup.setChecked(True)
         self.assertFalse(self.window.startup.isChecked())
         self.assertIn("无法修改", self.window.status.text())
+
+    def test_verified_campus_internet_clears_stale_failure_without_browser(self):
+        self.prepare_saved_account()
+        self.window.show_status('HTTP 555 未确认登录', False)
+        self.window.policy.completed(False, time.monotonic())
+        with patch('gui.run_login') as run:
+            self.window.on_probe_result(True, True)
+        run.assert_not_called()
+        self.assertIn('HTTPS 验证通过', self.window.status.text())
+        self.assertTrue(self.window.internet_online)
+
+    def test_single_timeout_is_pending_without_login_and_recovery_clears_it(self):
+        self.prepare_saved_account()
+        self.window.on_probe_result(True, True)
+        with patch('gui.run_login') as run:
+            self.window.on_probe_result(True, None)
+            self.assertIn('待确认', self.window.status.text())
+            run.assert_not_called()
+            self.window.on_probe_result(True, True)
+        self.assertIn('HTTPS 验证通过', self.window.status.text())
+        self.assertEqual(self.window.unconfirmed_probes, 0)
+
+    def test_pending_portal_result_uses_pending_status(self):
+        self.fill()
+        with patch('gui.run_login', side_effect=LoginPending('门户显示已在线，外网待确认；继续后台检测。')):
+            self.window.start_login()
+            self.wait_until(lambda: self.window.worker is None)
+        self.assertIn('待确认', self.window.status.text())
+        self.assertIn('#946b15', self.window.status.styleSheet())
+
+    def test_two_unconfirmed_probes_recheck_portal_without_success_cooldown(self):
+        self.prepare_saved_account()
+        self.window.on_probe_result(True, True)
+        with patch('gui.run_login', side_effect=LoginPending('门户状态待确认；继续后台检测。')) as run:
+            self.window.on_probe_result(True, None)
+            run.assert_not_called()
+            self.window.on_probe_result(True, None)
+            self.wait_until(lambda: self.window.worker is None)
+        run.assert_called_once()
+        self.assertFalse(self.window.internet_online)
+
+    def test_fresh_entry_is_saved_and_untrusted_entry_does_not_overwrite_it(self):
+        entry = 'http://10.254.241.66/eportal/index.jsp?wlanuserip=example&wlanacname=example'
+        self.window.remember_entry(entry)
+        from background import load_preferences
+        self.assertEqual(load_preferences(self.window.settings_path)['entry_url'], entry)
+        with self.assertRaises(LoginError):
+            self.window.remember_entry('https://example.test/login')
+        self.assertEqual(self.window.entry_url.text(), entry)
 
     def test_shortcut_creation_does_not_block_ui_and_exit_waits(self):
         def fake_shortcut():

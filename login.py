@@ -38,6 +38,10 @@ class LoginCancelled(LoginError):
     """用户取消认证。"""
 
 
+class LoginPending(LoginError):
+    """入口或外网探测无法确认；不能据此宣布认证失败。"""
+
+
 def validate_url(url: str) -> None:
     target = urlsplit(url)
     valid_path = target.path.startswith("/portal/") or target.path == "/eportal/index.jsp"
@@ -265,6 +269,7 @@ def automate(
     progress: Callable[[str], None] | None = None,
     cancelled: Callable[[], bool] | None = None,
     entry_resolver: Callable[[str, float], str | None] | None = None,
+    entry_changed: Callable[[str], None] | None = None,
 ) -> str:
     report = progress or (lambda message: print(message, flush=True))
 
@@ -305,6 +310,8 @@ def automate(
                     fresh_url = entry_resolver(status.terminal_redirect, max(0, deadline - time.monotonic()))
                     if fresh_url:
                         validate_url(fresh_url)
+                        if entry_changed is not None:
+                            entry_changed(fresh_url)
                         status.entry_expired = False
                         status.terminal_failures = 0
                         navigate(fresh_url, min(timeout * 1000, 15000))
@@ -351,15 +358,23 @@ def run_login(
     dry_run: bool = False,
     progress: Callable[[str], None] | None = None,
     cancelled: Callable[[], bool] | None = None,
+    entry_changed: Callable[[str], None] | None = None,
 ) -> str:
     """每次在调用线程创建独立的 Playwright 和浏览器，CLI/Qt 共用。"""
     validate_url(url)
     if any(not value.strip() for value in (credentials.username, credentials.password, credentials.operator)):
         raise LoginError("请填写账号、密码和运营商。")
     report = progress or (lambda message: print(message, flush=True))
-    from network import resolve_entry
+    from network import internet_available, resolve_entry
     if cancelled is not None and cancelled():
         raise LoginCancelled("已取消登录。")
+    if not dry_run:
+        report("正在核实校园网网卡的联网状态…")
+        verified = internet_available(min(timeout, 6))
+        if cancelled is not None and cancelled():
+            raise LoginCancelled("已取消登录。")
+        if verified is True:
+            return "校园网网卡已联网（HTTPS 验证通过），无需重复登录。"
     with sync_playwright() as p:
         try:
             browser = p.chromium.launch(channel="msedge", headless=headless, args=["--no-proxy-server"])
@@ -368,7 +383,21 @@ def run_login(
         try:
             page = browser.new_page(viewport={"width": 1366, "height": 900}, locale="zh-CN")
             report("正在打开校园网认证页面…")
-            return automate(page, credentials, timeout, dry_run, url, report, cancelled, resolve_entry)
+            try:
+                result = automate(page, credentials, timeout, dry_run, url, report, cancelled, resolve_entry, entry_changed)
+            except LoginError as exc:
+                if "HTTP 555" in str(exc):
+                    raise LoginPending("门户入口返回 HTTP 555，认证状态待确认；继续后台检测。") from None
+                raise
+            if dry_run:
+                return result
+            report("门户已报告在线，正在确认校园网网卡的外网连通性…")
+            verified = internet_available(min(timeout, 6))
+            if cancelled is not None and cancelled():
+                raise LoginCancelled("已取消登录。")
+            if verified is True:
+                return "校园网已联网（HTTPS 验证通过）。"
+            raise LoginPending("门户显示已在线，外网连通性暂未确认；继续后台检测。")
         finally:
             browser.close()
 

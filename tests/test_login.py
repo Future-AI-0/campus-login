@@ -11,9 +11,11 @@ from login import (
     BrowserError,
     Credentials,
     LoginError,
+    LoginPending,
     PORTAL_URL,
     automate,
     prepare_form,
+    run_login,
 )
 
 FORM = """
@@ -34,6 +36,34 @@ SERVICES = """
   <button id="confirm" disabled>确定</button>
 </app-service-selection>
 """
+
+
+class LoginConnectivityTests(unittest.TestCase):
+    credentials = Credentials('test-user', 'test-password', '中国电信')
+
+    def test_verified_internet_skips_browser_and_credentials(self):
+        with patch('network.internet_available', return_value=True), patch('login.sync_playwright') as browser:
+            self.assertIn('无需重复登录', run_login(self.credentials))
+            browser.assert_not_called()
+
+    def test_portal_online_without_external_proof_is_pending_and_browser_closed(self):
+        with patch('network.internet_available', return_value=None), patch('login.sync_playwright') as factory, patch('login.automate', return_value='校园网已连接。'):
+            browser = factory.return_value.__enter__.return_value.chromium.launch.return_value
+            with self.assertRaises(LoginPending):
+                run_login(self.credentials)
+            browser.close.assert_called_once()
+
+    def test_portal_555_without_external_proof_is_unknown_not_offline(self):
+        with patch('network.internet_available', return_value=None), patch('login.sync_playwright'), patch('login.automate', side_effect=LoginError('HTTP 555')):
+            with self.assertRaisesRegex(LoginPending, '状态待确认'):
+                run_login(self.credentials)
+
+    def test_post_login_requires_external_proof_and_dry_run_does_not_probe(self):
+        with patch('network.internet_available', side_effect=[None, True]), patch('login.sync_playwright'), patch('login.automate', return_value='校园网已连接。'):
+            self.assertIn('HTTPS 验证通过', run_login(self.credentials))
+        with patch('network.internet_available') as verify, patch('login.sync_playwright'), patch('login.automate', return_value='演练完成'):
+            self.assertEqual(run_login(self.credentials, dry_run=True), '演练完成')
+            verify.assert_not_called()
 
 
 class PortalTests(unittest.TestCase):
@@ -205,8 +235,10 @@ class PortalTests(unittest.TestCase):
         fresh = PORTAL_URL + '?fresh=1'
         self.context.route(PORTAL_URL, lambda route: route.fulfill(status=555, headers={'Location':'http://123.123.123.123'}, body='刷新入口'))
         resolver = Mock(return_value=fresh)
-        self.assertEqual(automate(self.page, self.credentials, 8, False, PORTAL_URL, entry_resolver=resolver), "校园网已连接。")
+        changed = Mock()
+        self.assertEqual(automate(self.page, self.credentials, 8, False, PORTAL_URL, entry_resolver=resolver, entry_changed=changed), "校园网已连接。")
         resolver.assert_called_once()
+        changed.assert_called_once_with(fresh)
         self.assertEqual(len(self.submissions), 2)
 
     def test_refreshed_entry_must_still_be_trusted(self):
