@@ -1,0 +1,14 @@
+.venv/
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+!CampusLogin-slim.spec
+settings.json
+settings.json.tmp
+ps.txt
+*.lnk
